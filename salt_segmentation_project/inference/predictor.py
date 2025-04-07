@@ -1,0 +1,245 @@
+import torch
+import torch.nn as nn
+import numpy as np
+from typing import Dict, Tuple, Optional, List
+from tqdm import tqdm
+import torch.nn.functional as F
+
+from models.segmentation_model import SaltSegmentationModel
+from data.transforms import get_validation_augmentation
+
+
+class Predictor:
+    """Predictor class for TGS Salt Segmentation inference with uncertainty."""
+    def __init__(
+        self,
+        model: SaltSegmentationModel,
+        device: str = 'cuda',
+        threshold: float = 0.5,
+        use_tta: bool = True,
+        use_mc_dropout: bool = True,
+        mc_samples: int = 10
+    ):
+        """Initialize predictor.
+        
+        Args:
+            model: Trained model instance
+            device: Device to run inference on
+            threshold: Probability threshold for binary segmentation
+            use_tta: Whether to use test-time augmentation
+            use_mc_dropout: Whether to use Monte Carlo dropout
+            mc_samples: Number of MC samples if using dropout
+        """
+        self.model = model.to(device)
+        self.device = device
+        self.threshold = threshold
+        self.use_tta = use_tta
+        self.use_mc_dropout = use_mc_dropout
+        self.mc_samples = mc_samples
+        
+    def tta_predict(
+        self,
+        image: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Use test-time augmentation for prediction.
+        
+        Uses horizontal and vertical flips as augmentations.
+        Predictions are averaged, and variance is computed.
+        
+        Args:
+            image: Input image tensor (1, C, H, W)
+            
+        Returns:
+            Tuple containing:
+            - Mean prediction
+            - Variance of predictions
+        """
+        self.model.eval()
+        predictions = []
+        
+        # Original image
+        seg_logits, _ = self.model(image)
+        predictions.append(torch.sigmoid(seg_logits))
+        
+        # Horizontal flip
+        flipped_h = torch.flip(image, dims=[3])
+        seg_logits, _ = self.model(flipped_h)
+        pred_h = torch.sigmoid(seg_logits)
+        predictions.append(torch.flip(pred_h, dims=[3]))
+        
+        # Vertical flip
+        flipped_v = torch.flip(image, dims=[2])
+        seg_logits, _ = self.model(flipped_v)
+        pred_v = torch.sigmoid(seg_logits)
+        predictions.append(torch.flip(pred_v, dims=[2]))
+        
+        # Both flips
+        flipped_hv = torch.flip(image, dims=[2, 3])
+        seg_logits, _ = self.model(flipped_hv)
+        pred_hv = torch.sigmoid(seg_logits)
+        predictions.append(torch.flip(pred_hv, dims=[2, 3]))
+        
+        # Stack and compute statistics
+        predictions = torch.stack(predictions, dim=0)
+        mean_pred = predictions.mean(dim=0)
+        var_pred = predictions.var(dim=0)
+        
+        return mean_pred, var_pred
+        
+    def mc_dropout_predict(
+        self,
+        image: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Use Monte Carlo dropout for uncertainty estimation.
+        
+        Args:
+            image: Input image tensor (1, C, H, W)
+            
+        Returns:
+            Tuple containing:
+            - Mean segmentation prediction
+            - Segmentation variance (uncertainty)
+            - Mean classification prediction
+            - Classification variance
+        """
+        self.model.enable_mc_dropout()
+        predictions_seg = []
+        predictions_cls = []
+        
+        # Multiple forward passes with dropout
+        for _ in range(self.mc_samples):
+            seg_logits, cls_logits = self.model(image)
+            predictions_seg.append(torch.sigmoid(seg_logits))
+            predictions_cls.append(torch.sigmoid(cls_logits))
+            
+        # Stack predictions
+        predictions_seg = torch.stack(predictions_seg, dim=0)
+        predictions_cls = torch.stack(predictions_cls, dim=0)
+        
+        # Compute statistics
+        mean_seg = predictions_seg.mean(dim=0)
+        var_seg = predictions_seg.var(dim=0)
+        mean_cls = predictions_cls.mean(dim=0)
+        var_cls = predictions_cls.var(dim=0)
+        
+        self.model.disable_mc_dropout()
+        return mean_seg, var_seg, mean_cls, var_cls
+        
+    @torch.no_grad()
+    def predict_single(
+        self,
+        image: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """Predict single image with uncertainty estimation.
+        
+        Args:
+            image: Input image tensor (1, C, H, W)
+            
+        Returns:
+            Dictionary with predictions and uncertainties
+        """
+        image = image.to(self.device)
+        
+        # Initialize predictions
+        seg_pred = None
+        seg_var = None
+        cls_pred = None
+        cls_var = None
+        
+        # TTA predictions
+        if self.use_tta:
+            seg_pred, seg_var = self.tta_predict(image)
+        
+        # MC dropout predictions
+        if self.use_mc_dropout:
+            mc_seg_pred, mc_seg_var, mc_cls_pred, mc_cls_var = self.mc_dropout_predict(image)
+            
+            if seg_pred is None:
+                seg_pred = mc_seg_pred
+                seg_var = mc_seg_var
+            else:
+                # Combine TTA and MC dropout predictions using weighted average
+                # Weight by inverse variance (more weight to more certain predictions)
+                epsilon = 1e-6  # To avoid division by zero
+                w1 = 1.0 / (seg_var + epsilon)
+                w2 = 1.0 / (mc_seg_var + epsilon)
+                seg_pred = (w1 * seg_pred + w2 * mc_seg_pred) / (w1 + w2)
+                # Take maximum variance as combined uncertainty
+                seg_var = torch.maximum(seg_var, mc_seg_var)
+                
+            cls_pred = mc_cls_pred
+            cls_var = mc_cls_var
+        
+        # If neither TTA nor MC dropout, do regular forward pass
+        if seg_pred is None:
+            seg_logits, cls_logits = self.model(image)
+            seg_pred = torch.sigmoid(seg_logits)
+            cls_pred = torch.sigmoid(cls_logits)
+            seg_var = torch.zeros_like(seg_pred)
+            cls_var = torch.zeros_like(cls_pred)
+        
+        return {
+            'seg_pred': seg_pred,
+            'seg_var': seg_var,
+            'cls_pred': cls_pred,
+            'cls_var': cls_var if cls_var is not None else torch.zeros_like(cls_pred)
+        }
+        
+    def predict_batch(
+        self,
+        images: torch.Tensor,
+        progress_bar: bool = True
+    ) -> Dict[str, torch.Tensor]:
+        """Predict batch of images.
+        
+        Args:
+            images: Batch of images (B, C, H, W)
+            progress_bar: Whether to show progress bar
+            
+        Returns:
+            Dictionary with predictions and uncertainties
+        """
+        images = images.to(self.device)
+        batch_size = images.size(0)
+        
+        # Initialize output tensors
+        seg_preds = []
+        seg_vars = []
+        cls_preds = []
+        cls_vars = []
+        
+        # Process each image
+        iterator = tqdm(range(batch_size)) if progress_bar else range(batch_size)
+        for i in iterator:
+            predictions = self.predict_single(images[i:i+1])
+            seg_preds.append(predictions['seg_pred'])
+            seg_vars.append(predictions['seg_var'])
+            cls_preds.append(predictions['cls_pred'])
+            cls_vars.append(predictions['cls_var'])
+        
+        # Concatenate results
+        return {
+            'seg_pred': torch.cat(seg_preds, dim=0),
+            'seg_var': torch.cat(seg_vars, dim=0),
+            'cls_pred': torch.cat(cls_preds, dim=0),
+            'cls_var': torch.cat(cls_vars, dim=0)
+        }
+        
+    def get_binary_prediction(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        threshold: Optional[float] = None
+    ) -> torch.Tensor:
+        """Get binary mask from predictions.
+        
+        Args:
+            predictions: Dictionary with predictions from predict_single/predict_batch
+            threshold: Optional override for default threshold
+            
+        Returns:
+            Binary mask tensor
+        """
+        if threshold is None:
+            threshold = self.threshold
+            
+        return (predictions['seg_pred'] > threshold).float()

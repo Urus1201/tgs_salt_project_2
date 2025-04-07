@@ -1,0 +1,118 @@
+# Default configuration for TGS Salt Segmentation
+
+# Data settings
+data:
+  base_dir: '${DATA_DIR:/root/tgs_salt_mode_2/data}'  # Default path, can be overridden with env variable
+  train_csv: 'train.csv'
+  test_csv: 'sample_submission.csv'
+  depths_csv: 'depths.csv'
+  train_images: 'train/images'
+  train_masks: 'train/masks'
+  test_images: 'test/images'
+  val_split: 0.15  # 15% validation split
+  use_2_5d: true  # Use 2.5D input (3 consecutive slices)
+  img_size: 101
+  batch_size: 32
+  num_workers: 4
+  add_depth_info: true
+  prefetch_factor: 2  # Number of batches to prefetch (>1 helps with I/O)
+  persistent_workers: true  # Keep workers alive between epochs
+
+# Augmentation settings
+augmentation:
+  use_augmentation: true
+  p_flip: 0.5
+  p_rotate: 0.5
+  rotate_limit: 45
+  brightness_limit: 0.2
+  contrast_limit: 0.2
+  noise_std: 0.02
+  
+  # Validation/test augmentations (minimal)
+  val_size: 101
+
+# Model settings
+model:
+  name: "swin_unet"
+  backbone: "swin_tiny_patch4_window7_224"
+  pretrained: true
+  in_channels: 3
+  img_size: 101
+  embed_dim: 96
+  depths: [2, 2, 6, 2]  # Swin Transformer layers per stage
+  num_heads: [3, 6, 12, 24]  # Number of attention heads per stage
+  window_size: 7
+  dropout_rate: 0.1
+  decoder_dropout: true
+  use_checkpoint: true  # Use gradient checkpointing for memory efficiency
+  mae_pretrained: false  # Whether to load MAE pretrained weights
+  mae_checkpoint: null   # Path to MAE checkpoint if using pretrained
+  cls_head: true
+
+# MAE pretraining settings
+mae:
+  decoder_embed_dim: 64
+  decoder_depth: 4
+  decoder_num_heads: 8
+  mask_ratio: 0.75
+  batch_size: 256
+  num_epochs: 100
+  lr: 0.0001
+  weight_decay: 0.05
+  early_stop_patience: 10
+  save_dir: "checkpoints/mae"
+
+# Training settings
+training:
+  distributed: false  # Whether to use distributed training
+  device: "cuda"  # "cuda" or "cpu"
+  num_epochs: 100
+  optimizer: "adamw"
+  lr: 0.0001
+  weight_decay: 0.01
+  scheduler: "cosine"  # "cosine" or "plateau"
+  warmup_epochs: 5
+  early_stop_patience: 15
+  grad_clip: 5.0
+  save_dir: "checkpoints"
+  amp: true  # Use automatic mixed precision
+  compile: true  # Use torch.compile() for optimization
+  channels_last: true  # Use channels last memory format
+  
+  # Distributed training settings
+  backend: "nccl"  # DDP backend: "nccl" (GPU) or "gloo" (CPU)
+  find_unused_parameters: false  # Set to true if needed for DDP
+  gradient_as_bucket_view: true  # More efficient DDP gradient sync
+  static_graph: true  # Optimize DDP for fixed graphs
+
+# Loss function settings
+loss:
+  dice_weight: 1.0
+  focal_weight: 1.0
+  boundary_weight: 0.5
+  cls_weight: 0.5
+  focal_gamma: 2.0
+  focal_alpha: 0.25
+
+# Inference settings
+inference:
+  checkpoint: "best_model.pth"
+  batch_size: 16
+  threshold: 0.5  # Probability threshold for binary prediction
+  use_tta: true   # Use test-time augmentation
+  use_mc_dropout: true  # Use Monte Carlo dropout for uncertainty
+  mc_samples: 10  # Number of MC dropout samples
+  min_size: 100
+  refinement:
+    enabled: true
+    uncertainty_threshold: 0.2
+    boundary_kernel_size: 3
+    crf_iterations: 5
+
+# Logging settings
+logging:
+  log_dir: "logs"
+  save_images: true
+  num_validation_images: 8
+  log_every_n_steps: 100
+  save_every_n_epochs: 5
