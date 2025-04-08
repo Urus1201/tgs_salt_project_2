@@ -9,6 +9,7 @@ data:
   train_images: 'train/images'
   train_masks: 'train/masks'
   test_images: 'test/images'
+  train_dir: 'train'  # Directory containing training images and masks
   val_split: 0.15  # 15% validation split
   use_2_5d: true  # Use 2.5D input (3 consecutive slices)
   img_size: 101
@@ -108,6 +109,18 @@ inference:
     uncertainty_threshold: 0.2
     boundary_kernel_size: 3
     crf_iterations: 5
+
+# Refinement model settings
+refinement:
+  main_model_checkpoint: "${CHECKPOINT_PATH:checkpoints/model_best.pth}"  # Path to main model checkpoint
+  checkpoint_path: "checkpoints/refinement_model.pth"  # Where to save refinement model
+  epochs: 50
+  learning_rate: 1e-4
+  weight_decay: 1e-5
+  patience: 10
+  base_channels: 16
+  num_levels: 3
+  dropout_rate: 0.2
 
 # Logging settings
 logging:

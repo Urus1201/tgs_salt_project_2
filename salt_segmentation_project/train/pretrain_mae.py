@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import numpy as np
 from typing import Dict, Optional, Tuple
+import os
 
 from models.encoder_swin import SwinEncoder
 from models.mae_decoder import MAEDecoder
@@ -132,18 +133,19 @@ class MAEPretrainer:
         self.decoder.train()
         
         total_loss = 0
-        for batch in self.train_loader:
-            imgs = batch['image'][:, 0:1].to(self.device)  # Take only first channel for MAE
-            
-            # Forward pass and loss
-            loss, metrics = self.forward_loss(imgs)
-            
-            # Backward pass
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            
-            total_loss += metrics['loss']
+        for imgs, _ in self.train_loader:  # Unpack image from tuple, ignore mask
+            if isinstance(imgs, torch.Tensor):
+                imgs = imgs[:, 0:1].to(self.device)  # Take only first channel for MAE
+                
+                # Forward pass and loss
+                loss, metrics = self.forward_loss(imgs)
+                
+                # Backward pass
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                
+                total_loss += metrics['loss']
         
         return {'train_loss': total_loss / len(self.train_loader)}
 
@@ -157,10 +159,11 @@ class MAEPretrainer:
         self.decoder.eval()
         
         total_loss = 0
-        for batch in self.val_loader:
-            imgs = batch['image'][:, 0:1].to(self.device)
-            loss, metrics = self.forward_loss(imgs)
-            total_loss += metrics['loss']
+        for imgs, _ in self.val_loader:  # Unpack image from tuple, ignore mask
+            if isinstance(imgs, torch.Tensor):
+                imgs = imgs[:, 0:1].to(self.device)
+                loss, metrics = self.forward_loss(imgs)
+                total_loss += metrics['loss']
         
         return {'val_loss': total_loss / len(self.val_loader)}
 
@@ -223,10 +226,13 @@ def pretrain_mae(config: Dict):
     
     # Setup data
     train_dataset = SaltDataset(
-        data_dir=config['data']['train_dir'],
+        csv_file=os.path.join(config['data']['base_dir'], config['data']['train_csv']),
+        image_dir=os.path.join(config['data']['base_dir'], config['data']['train_images']),
+        mask_dir=None,  # No masks needed for MAE pretraining
+        depths_csv=None,  # Depths not used for MAE
         transform=None,  # Add transforms if needed
-        use_depth=False,  # Not needed for MAE
-        use_neighbors=False  # Single channel for MAE
+        use_2_5d=False,  # Single channel for MAE
+        mode='test'  # Use test mode to avoid loading masks
     )
     train_loader = DataLoader(
         train_dataset,

@@ -377,14 +377,13 @@ class SwinEncoder(nn.Module):
                 'norm': nn.LayerNorm(curr_dim)
             })
             
-            # Add downsample if not the last layer
-            if i_layer < self.num_layers - 1:
-                # PatchMerging for downsampling: halve spatial dims, double channels
-                layer['downsample'] = nn.Sequential(
-                    nn.LayerNorm(4 * curr_dim),
-                    nn.Linear(4 * curr_dim, 2 * curr_dim)
-                )
-                curr_dim *= 2
+            # Comment out downsample to keep resolution
+            # if i_layer < self.num_layers - 1:
+            #     layer['downsample'] = nn.Sequential(
+            #         nn.LayerNorm(4 * curr_dim),
+            #         nn.Linear(4 * curr_dim, 2 * curr_dim)
+            #     )
+            #     curr_dim *= 2
             
             self.layers.append(layer)
         
@@ -399,6 +398,67 @@ class SwinEncoder(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
+    def prepare_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        """Prepare tokens by adding positional embeddings.
+        Args:
+            x: Input tensor of shape (B, L, D) where L is sequence length and D is embedding dimension
+        Returns:
+            Tensor of same shape with positional embeddings added
+        """
+        B, L, D = x.shape
+        
+        # Create positional embeddings with the exact expected sequence length (676 for 26x26 grid)
+        # Registering this as a buffer rather than a Parameter to avoid accumulating gradients
+        if not hasattr(self, 'pos_embed') or self.pos_embed.shape[1] != L:
+            pos_embed = torch.zeros(1, L, D, device=x.device)
+            nn.init.trunc_normal_(pos_embed, std=.02)
+            self.register_buffer('pos_embed', pos_embed, persistent=False)
+        
+        # Add positional embeddings to patch embeddings
+        x = x + self.pos_embed
+        return x
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Process features through transformer blocks without final reshaping.
+        Args:
+            x: Input tensor of shape (B, L, D) where L is sequence length
+        Returns:
+            Processed features of shape (B, L, embed_dim)
+        """
+        B, L, D = x.shape
+        
+        # Adapt to the input sequence length by recalculating grid dimensions
+        # This allows flexibility when input has a different patch count
+        grid_size = int(np.sqrt(L + 0.5))  # Adding 0.5 for numerical stability
+        
+        # Debugging grid dimensions and sequence length
+        print(f"DEBUG - encoder forward_features - Input: B={B}, L={L}, D={D}, calculated grid_size={grid_size}")
+        
+        # Update grid dimensions for this forward pass and store as object attributes
+        # so they can be accessed by the decoder if needed
+        self.grid_h = self.grid_w = grid_size
+        self.current_num_patches = L
+        
+        # Project to embedding dimension if needed
+        if D != self.embed_dim:
+            proj = nn.Linear(D, self.embed_dim).to(x.device)
+            x = proj(x)
+        
+        # Add positional embeddings
+        x = self.prepare_tokens(x)
+        
+        # Process through ALL Swin blocks for all layers (not just first layer)
+        for i_layer, layer_dict in enumerate(self.layers):
+            # Apply all blocks in this layer
+            for block in layer_dict['blocks']:
+                x = block(x)
+            
+            # Apply normalization
+            x = layer_dict['norm'](x)
+        
+        # Only return the tensor to maintain compatibility with existing code
+        return x
+
     def forward(self, x):
         """Forward pass.
         Args:
@@ -409,7 +469,7 @@ class SwinEncoder(nn.Module):
         B, C, H, W = x.shape
         
         # Debug input shape
-        print(f"DEBUG - Input shape: {x.shape}")
+        # print(f"DEBUG - Input shape: {x.shape}")
         
         # Pad input to be divisible by patch_size
         if self.pad_h > 0 or self.pad_w > 0:
@@ -419,13 +479,13 @@ class SwinEncoder(nn.Module):
             padding_info = None
         
         # Debug padded shape
-        print(f"DEBUG - After padding: {x.shape}")
+        # print(f"DEBUG - After padding: {x.shape}")
         
         # Apply patch embedding using Conv2d
         x = self.patch_embed(x)  # B, embed_dim, grid_h, grid_w
         
         # Debug after patch embedding
-        print(f"DEBUG - After patch embed: {x.shape}")
+        # print(f"DEBUG - After patch embed: {x.shape}")
         
         # Initialize feature storage
         features = []
@@ -438,7 +498,7 @@ class SwinEncoder(nn.Module):
         x = self.pos_drop(x)
         
         # Debug sequential format
-        print(f"DEBUG - Sequential format: {x.shape}, expected spatial: ({curr_h},{curr_w})")
+        # print(f"DEBUG - Sequential format: {x.shape}, expected spatial: ({curr_h},{curr_w})")
         
         # Process through Swin blocks
         for i_layer, layer_dict in enumerate(self.layers):
@@ -457,8 +517,8 @@ class SwinEncoder(nn.Module):
             expected_size = B * curr_h * curr_w * curr_dim
             actual_size = x.numel()
             
-            print(f"DEBUG - Layer {i_layer}: Expected shape [{B}, {curr_h}, {curr_w}, {curr_dim}] "
-                  f"(size={expected_size}), Actual tensor size={actual_size}")
+            # print(f"DEBUG - Layer {i_layer}: Expected shape [{B}, {curr_h}, {curr_w}, {curr_dim}] "
+            #       f"(size={expected_size}), Actual tensor size={actual_size}")
             
             if expected_size != actual_size:
                 # This is where the issue occurs - fix dimensions
@@ -466,7 +526,7 @@ class SwinEncoder(nn.Module):
                 seq_len = x.shape[1]
                 spatial_size = int(np.sqrt(seq_len + 0.5))  # Adding 0.5 for numerical stability
                 curr_h = curr_w = spatial_size
-                print(f"DEBUG - Fixing dimensions: seq_len={seq_len}, new spatial=({curr_h},{curr_w})")
+                # print(f"DEBUG - Fixing dimensions: seq_len={seq_len}, new spatial=({curr_h},{curr_w})")
             
             # Reshape to spatial format for feature storage
             curr_feat = x.view(B, curr_h, curr_w, curr_dim).permute(0, 3, 1, 2).contiguous()
@@ -502,6 +562,6 @@ class SwinEncoder(nn.Module):
                 # 4. Update spatial dimensions (halved)
                 curr_h, curr_w = curr_h // 2, curr_w // 2
                 
-                print(f"DEBUG - After downsample: seq shape={x.shape}, spatial=({curr_h},{curr_w})")
+                # print(f"DEBUG - After downsample: seq shape={x.shape}, spatial=({curr_h},{curr_w})")
         
         return features, padding_info

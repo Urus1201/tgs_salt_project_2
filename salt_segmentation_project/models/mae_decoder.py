@@ -46,20 +46,33 @@ class MAEDecoder(nn.Module):
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: Encoded features from visible patches [B, N, C]
-            mask: Boolean mask indicating masked patches [B, N], True = masked
+            x: Encoded features from visible patches [B, N_visible, C]
+            mask: Boolean mask indicating masked patches [B, N_total], True = masked
         Returns:
-            Reconstructed image patches [B, N, patch_size*patch_size*in_channels]
+            Reconstructed image patches [B, N_total, patch_size*patch_size*in_channels]
         """
-        B, N, C = x.shape
+        B, N_visible, C = x.shape
+        N_total = mask.shape[1]  # Total number of patches (676 for 26x26 grid)
         
         # Project encoder features to decoder dim
         x = self.decoder_embed(x)
         
-        # Append mask tokens for masked patches
-        mask_tokens = self.mask_token.expand(B, N, -1)
-        w = mask.unsqueeze(-1).type_as(mask_tokens)
-        x = x * (1 - w) + mask_tokens * w
+        # Create mask tokens for all patches
+        mask_tokens = self.mask_token.expand(B, N_total, -1)
+        
+        # Create empty tensor for all patches
+        full_x = torch.zeros((B, N_total, x.shape[-1]), device=x.device)
+        
+        # Ensure mask is boolean type and get visible indices
+        bool_mask = mask.bool()
+        visible_idx = torch.nonzero(~bool_mask)[:,1][:N_visible]  # Get indices of visible patches
+        
+        # Put visible patches in their correct positions
+        full_x[:, visible_idx] = x
+        
+        # Add mask tokens for masked positions
+        w = bool_mask.unsqueeze(-1).type_as(mask_tokens)
+        x = full_x * (1 - w) + mask_tokens * w
         
         # Apply transformer blocks
         for block in self.decoder_blocks:
@@ -80,8 +93,10 @@ class TransformerBlock(nn.Module):
         mlp_ratio: float = 4.0,
         qkv_bias: bool = True,
         norm_layer = nn.LayerNorm,
+        use_checkpoint: bool = True,  # Enable by default for memory efficiency
     ):
         super().__init__()
+        self.use_checkpoint = use_checkpoint
         self.norm1 = norm_layer(dim)
         self.attn = nn.MultiheadAttention(
             dim, num_heads, bias=qkv_bias, batch_first=True
@@ -94,7 +109,12 @@ class TransformerBlock(nn.Module):
             nn.Linear(mlp_hidden_dim, dim)
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.norm1(x), self.norm1(x), self.norm1(x))[0]
         x = x + self.mlp(self.norm2(x))
         return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_checkpoint and x.requires_grad:
+            return torch.utils.checkpoint.checkpoint(self._forward, x)
+        return self._forward(x)

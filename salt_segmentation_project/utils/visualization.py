@@ -3,6 +3,10 @@ import matplotlib.pyplot as plt
 from typing import Dict, List, Optional
 import seaborn as sns
 from pathlib import Path
+import pandas as pd
+import os
+from PIL import Image
+from inference.submission import rle_to_mask
 
 
 def plot_training_history(
@@ -275,3 +279,42 @@ def log_images(
                         pred_vis = pred_vis.repeat(1, 1, 1, 3)
                     logger.add_images(f'{tag}/{pred_name}', pred_vis, 
                                     global_step, dataformats='NHWC')
+
+
+def visualize_predictions(submission_path, test_images_dir, num_samples=5):
+    """Visualize sample predictions from the submission file.
+
+    Args:
+        submission_path (str): Path to the submission CSV file.
+        test_images_dir (str): Directory containing test images.
+        num_samples (int): Number of samples to visualize.
+    """
+    # Load submission file
+    submission = pd.read_csv(submission_path)
+
+    # Randomly select samples
+    samples = submission.sample(n=num_samples, random_state=42)
+
+    # Plot each sample
+    for _, row in samples.iterrows():
+        image_id = row['id']
+        rle_mask = row['rle_mask']
+
+        # Load test image
+        image_path = os.path.join(test_images_dir, f"{image_id}.png")
+        image = np.array(Image.open(image_path))
+
+        # Decode RLE mask
+        mask = rle_to_mask(rle_mask, shape=image.shape)
+
+        # Plot image and mask
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+        axes[0].imshow(image, cmap='gray')
+        axes[0].set_title('Test Image')
+        axes[0].axis('off')
+
+        axes[1].imshow(mask, cmap='gray')
+        axes[1].set_title('Predicted Mask')
+        axes[1].axis('off')
+
+        plt.show()

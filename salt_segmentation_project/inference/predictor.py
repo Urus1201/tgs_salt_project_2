@@ -190,7 +190,7 @@ class Predictor:
         images: torch.Tensor,
         progress_bar: bool = True
     ) -> Dict[str, torch.Tensor]:
-        """Predict batch of images.
+        """Predict batch of images efficiently.
         
         Args:
             images: Batch of images (B, C, H, W)
@@ -200,29 +200,94 @@ class Predictor:
             Dictionary with predictions and uncertainties
         """
         images = images.to(self.device)
-        batch_size = images.size(0)
         
-        # Initialize output tensors
-        seg_preds = []
-        seg_vars = []
-        cls_preds = []
-        cls_vars = []
+        with torch.no_grad():
+            if self.use_tta:
+                # Initialize predictions
+                all_seg_preds = []
+                all_cls_preds = []
+                
+                # Original images
+                seg_logits, cls_logits = self.model(images)
+                all_seg_preds.append(torch.sigmoid(seg_logits))
+                all_cls_preds.append(torch.sigmoid(cls_logits))
+                
+                # Horizontal flip
+                flipped_h = torch.flip(images, dims=[3])
+                seg_logits, cls_logits = self.model(flipped_h)
+                all_seg_preds.append(torch.flip(torch.sigmoid(seg_logits), dims=[3]))
+                all_cls_preds.append(torch.sigmoid(cls_logits))
+                
+                # Vertical flip
+                flipped_v = torch.flip(images, dims=[2])
+                seg_logits, cls_logits = self.model(flipped_v)
+                all_seg_preds.append(torch.flip(torch.sigmoid(seg_logits), dims=[2]))
+                all_cls_preds.append(torch.sigmoid(cls_logits))
+                
+                # Both flips
+                flipped_hv = torch.flip(images, dims=[2, 3])
+                seg_logits, cls_logits = self.model(flipped_hv)
+                all_seg_preds.append(torch.flip(torch.sigmoid(seg_logits), dims=[2, 3]))
+                all_cls_preds.append(torch.sigmoid(cls_logits))
+                
+                # Stack and compute statistics
+                all_seg_preds = torch.stack(all_seg_preds, dim=0)  # (num_aug, B, 1, H, W)
+                all_cls_preds = torch.stack(all_cls_preds, dim=0)  # (num_aug, B, 1)
+                
+                seg_pred = all_seg_preds.mean(dim=0)  # (B, 1, H, W)
+                seg_var = all_seg_preds.var(dim=0)    # (B, 1, H, W)
+                cls_pred = all_cls_preds.mean(dim=0)  # (B, 1)
+                cls_var = all_cls_preds.var(dim=0)    # (B, 1)
+                
+            if self.use_mc_dropout:
+                # Multiple forward passes with dropout
+                mc_seg_preds = []
+                mc_cls_preds = []
+                
+                self.model.enable_mc_dropout()
+                for _ in range(self.mc_samples):
+                    seg_logits, cls_logits = self.model(images)
+                    mc_seg_preds.append(torch.sigmoid(seg_logits))
+                    mc_cls_preds.append(torch.sigmoid(cls_logits))
+                self.model.disable_mc_dropout()
+                
+                # Stack predictions
+                mc_seg_preds = torch.stack(mc_seg_preds, dim=0)  # (num_samples, B, 1, H, W)
+                mc_cls_preds = torch.stack(mc_cls_preds, dim=0)  # (num_samples, B, 1)
+                
+                mc_seg_pred = mc_seg_preds.mean(dim=0)  # (B, 1, H, W)
+                mc_seg_var = mc_seg_preds.var(dim=0)    # (B, 1, H, W)
+                mc_cls_pred = mc_cls_preds.mean(dim=0)  # (B, 1)
+                mc_cls_var = mc_cls_preds.var(dim=0)    # (B, 1)
+                
+                if 'seg_pred' in locals():
+                    # Combine TTA and MC dropout predictions
+                    epsilon = 1e-6
+                    w1 = 1.0 / (seg_var + epsilon)
+                    w2 = 1.0 / (mc_seg_var + epsilon)
+                    seg_pred = (w1 * seg_pred + w2 * mc_seg_pred) / (w1 + w2)
+                    seg_var = torch.maximum(seg_var, mc_seg_var)
+                    cls_pred = mc_cls_pred
+                    cls_var = mc_cls_var
+                else:
+                    seg_pred = mc_seg_pred
+                    seg_var = mc_seg_var
+                    cls_pred = mc_cls_pred
+                    cls_var = mc_cls_var
+            
+            if not (self.use_tta or self.use_mc_dropout):
+                # Regular forward pass
+                seg_logits, cls_logits = self.model(images)
+                seg_pred = torch.sigmoid(seg_logits)
+                cls_pred = torch.sigmoid(cls_logits)
+                seg_var = torch.zeros_like(seg_pred)
+                cls_var = torch.zeros_like(cls_pred)
         
-        # Process each image
-        iterator = tqdm(range(batch_size)) if progress_bar else range(batch_size)
-        for i in iterator:
-            predictions = self.predict_single(images[i:i+1])
-            seg_preds.append(predictions['seg_pred'])
-            seg_vars.append(predictions['seg_var'])
-            cls_preds.append(predictions['cls_pred'])
-            cls_vars.append(predictions['cls_var'])
-        
-        # Concatenate results
         return {
-            'seg_pred': torch.cat(seg_preds, dim=0),
-            'seg_var': torch.cat(seg_vars, dim=0),
-            'cls_pred': torch.cat(cls_preds, dim=0),
-            'cls_var': torch.cat(cls_vars, dim=0)
+            'seg_pred': seg_pred,
+            'seg_var': seg_var,
+            'cls_pred': cls_pred,
+            'cls_var': cls_var
         }
         
     def get_binary_prediction(

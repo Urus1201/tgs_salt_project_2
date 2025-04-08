@@ -41,22 +41,40 @@ def get_absolute_path(relative_path: str, base_dir: str) -> str:
         return relative_path
     return os.path.join(base_dir, relative_path)
 
-def prepare_data_paths(config: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Update configuration with resolved absolute paths for data files.
+def prepare_data_paths(config: Dict) -> Dict:
+    """Resolve path templates in config, especially with environment variables.
     
     Args:
-        config: Configuration dictionary
+        config: Raw configuration dictionary
         
     Returns:
-        Updated configuration dictionary
+        Config with resolved paths
     """
-    # Resolve base directory
-    base_dir = resolve_path(config['data']['base_dir'])
+    # Resolve DATA_DIR environment variable in data paths
+    if 'data' in config:
+        data_dir = config['data']['base_dir']
+        if '${' in data_dir:
+            # Extract environment variable name and default
+            var_name, default = data_dir[2:-1].split(':', 1)
+            data_dir = os.environ.get(var_name, default)
+            config['data']['base_dir'] = data_dir
+        
+        # Update paths to be absolute
+        for key in ['train_csv', 'test_csv', 'depths_csv']:
+            if key in config['data']:
+                config['data'][key] = os.path.join(data_dir, config['data'][key])
+                
+        for key in ['train_images', 'train_masks', 'test_images']:
+            if key in config['data']:
+                config['data'][key] = os.path.join(data_dir, config['data'][key])
     
-    # Update paths in config
-    for key in ['train_csv', 'test_csv', 'depths_csv', 'train_images', 'train_masks', 'test_images']:
-        if key in config['data']:
-            config['data'][key] = get_absolute_path(config['data'][key], base_dir)
+    # Resolve checkpoint paths for refinement 
+    if 'refinement' in config and 'main_model_checkpoint' in config['refinement']:
+        main_checkpoint = config['refinement']['main_model_checkpoint']
+        if '${' in main_checkpoint:
+            # Extract environment variable name and default
+            var_name, default = main_checkpoint[2:-1].split(':', 1)
+            main_checkpoint = os.environ.get(var_name, default)
+            config['refinement']['main_model_checkpoint'] = main_checkpoint
     
     return config

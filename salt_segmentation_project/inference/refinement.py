@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional, List
 
 
 class RefinementNet(nn.Module):
@@ -175,12 +175,20 @@ class UncertaintyRefinement:
         self.model.eval()
         
         with torch.no_grad():
+            # Ensure predictions match image size
+            seg_pred = F.interpolate(initial_pred['seg_pred'], 
+                                   size=image.shape[2:], 
+                                   mode='bilinear', 
+                                   align_corners=True)
+            seg_var = F.interpolate(initial_pred['seg_var'], 
+                                  size=image.shape[2:], 
+                                  mode='bilinear', 
+                                  align_corners=True)
+            
             # Prepare input: concatenate image, initial mask, and uncertainty map
-            x = torch.cat([
-                image,
-                initial_pred['seg_pred'],
-                initial_pred['seg_var']
-            ], dim=1)
+            x = torch.cat([image.to(self.device), 
+                         seg_pred.to(self.device), 
+                         seg_var.to(self.device)], dim=1)
             
             # Get refined prediction
             refined_logits = self.model(x)
@@ -190,7 +198,7 @@ class UncertaintyRefinement:
             binary_mask = (refined_pred > self.threshold).float()
             
             # If classifier is very confident about no salt, return empty mask
-            if initial_pred['cls_pred'].item() < 0.1:
+            if 'cls_pred' in initial_pred and initial_pred['cls_pred'].item() < 0.1:
                 binary_mask.zero_()
                 
         return binary_mask
@@ -215,6 +223,10 @@ class UncertaintyRefinement:
                 - Input tensor [image, pred_mask, uncertainty]
                 - Target mask
         """
+        # Resize pred_mask and uncertainty to match the image size
+        pred_mask = F.interpolate(pred_mask, size=image.shape[2:], mode='bilinear', align_corners=True)
+        uncertainty = F.interpolate(uncertainty, size=image.shape[2:], mode='bilinear', align_corners=True)
+
         # Create input by concatenating channels
         x = torch.cat([image, pred_mask, uncertainty], dim=1)
         return x, true_mask
