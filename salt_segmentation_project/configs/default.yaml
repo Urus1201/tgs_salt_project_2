@@ -35,33 +35,49 @@ augmentation:
 # Model settings
 model:
   name: "swin_unet"
-  backbone: "swin_tiny_patch4_window7_224"
-  pretrained: true
+  swin_variant: "microsoft/swin-tiny-patch4-window7-224"
+  pretrained: true              # Use ImageNet weights
+  mae_pretrained: true         # Set to true to use the pretrained weights
+  mae_checkpoint: "checkpoints/mae/best_encoder.pth"
   in_channels: 3
-  img_size: 101
-  embed_dim: 96
-  depths: [2, 2, 6, 2]  # Swin Transformer layers per stage
-  num_heads: [3, 6, 12, 24]  # Number of attention heads per stage
-  window_size: 7
-  dropout_rate: 0.1
-  decoder_dropout: true
-  use_checkpoint: true  # Use gradient checkpointing for memory efficiency
-  mae_pretrained: false  # Whether to load MAE pretrained weights
-  mae_checkpoint: null   # Path to MAE checkpoint if using pretrained
+  seg_out_channels: 1
+  cls_out_channels: 1
   cls_head: true
 
 # MAE pretraining settings
 mae:
-  decoder_embed_dim: 64
-  decoder_depth: 4
-  decoder_num_heads: 8
+  model_name: "microsoft/swin-tiny-patch4-window7-224"
+  pretrained: false  # Start without pretrained weights for pretraining
+  img_size: 101
+  patch_size: 4
+  in_channels: 1  # Align with SwinEncoder default
+  embed_dim: 96
+  depths: [2, 2, 6, 2]  # Match SwinEncoder structure
+  num_heads: [3, 6, 12, 24]  # Match SwinEncoder structure
+  window_size: 7
+  mlp_ratio: 4.0
+  qkv_bias: true
+  drop_rate: 0.0  # Regular dropout
+  attn_drop_rate: 0.0  # Attention dropout
+  drop_path_rate: 0.1  # Stochastic depth
+  # Decoder specific settings
+  decoder_embed_dim: 48
+  decoder_depth: 2
+  decoder_num_heads: 4
   mask_ratio: 0.75
-  batch_size: 256
-  num_epochs: 100
-  lr: 0.0001
+  # Training settings
+  device: "cuda"
+  batch_size: 64
+  num_epochs: 15
+  learning_rate: 0.0001  # Keep this for pretrain_mae.py
+  lr: 0.0001  # Add this for compatibility with other parts
   weight_decay: 0.05
+  lr_decay_factor: 0.5
+  lr_decay_patience: 5
   early_stop_patience: 10
   save_dir: "checkpoints/mae"
+  log_dir: "checkpoints/mae/logs"
+  vis_dir: "checkpoints/mae/visualizations"
 
 # Training settings
 training:
@@ -75,7 +91,7 @@ training:
   warmup_epochs: 5
   early_stop_patience: 15
   grad_clip: 5.0
-  save_dir: "checkpoints"
+  save_dir: "checkpoints/logs"
   amp: true  # Use automatic mixed precision
   compile: true  # Use torch.compile() for optimization
   channels_last: true  # Use channels last memory format

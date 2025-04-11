@@ -9,6 +9,7 @@ from torch.utils.data.distributed import DistributedSampler
 import numpy as np
 from pathlib import Path
 from typing import Dict, Tuple, Optional
+from collections import OrderedDict
 
 from data.dataset import SaltDataset
 from data.transforms import get_training_augmentation, get_validation_augmentation
@@ -20,6 +21,7 @@ from inference.predictor import Predictor
 from inference.submission import SubmissionGenerator, mask_to_rle
 from inference.refinement import RefinementNet, UncertaintyRefinement, train_refinement_model
 from utils.path_utils import prepare_data_paths
+from utils.find_checkpoint import find_checkpoint
 
 
 def load_config(config_path: str) -> Dict:
@@ -125,6 +127,77 @@ def create_dataloaders(config: Dict, local_rank: int = -1) -> Tuple[DataLoader, 
     return train_loader, val_loader, test_loader
 
 
+def train_epoch(model, dataloader, optimizer, device, epoch, vis_dir=None):
+    """Train model for one epoch."""
+    model.train()
+    total_loss = 0.0
+    for batch_idx, (images, _) in enumerate(dataloader):
+        images = images.to(device)
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = outputs['loss']
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(dataloader)
+
+
+def validate(model, dataloader, device, epoch, vis_dir=None):
+    """Validate model."""
+    model.eval()
+    total_loss = 0.0
+    with torch.no_grad():
+        for batch_idx, (images, _) in enumerate(dataloader):
+            images = images.to(device)
+            outputs = model(images)
+            loss = outputs['loss']
+            total_loss += loss.item()
+    return total_loss / len(dataloader)
+
+
+def train_mae(model, train_loader, val_loader, optimizer, scheduler, num_epochs, device, 
+              checkpoint_dir, log_dir, vis_dir=None):
+    """Train MAE model."""
+    for epoch in range(num_epochs):
+        train_loss = train_epoch(model, train_loader, optimizer, device, epoch, vis_dir)
+        val_loss = validate(model, val_loader, device, epoch, vis_dir)
+        scheduler.step(val_loss)
+        torch.save(model.state_dict(), os.path.join(checkpoint_dir, f'epoch_{epoch}.pth'))
+
+def convert_mae_checkpoint_for_timm(mae_ckpt_path: str) -> OrderedDict:
+    """
+    Convert a MAE-pretrained Swin encoder checkpoint to match timm's Swin format.
+    
+    Args:
+        mae_ckpt_path: path to the MAE checkpoint (.pth)
+    
+    Returns:
+        OrderedDict suitable for loading into timm.create_model(..., pretrained=False)
+    """
+    print(f"Loading MAE checkpoint from: {mae_ckpt_path}")
+    state_dict = torch.load(mae_ckpt_path, map_location='cpu')
+
+    new_state_dict = OrderedDict()
+
+    for k, v in state_dict.items():
+        # Convert patch embedding
+        if k.startswith("patch_embed."):
+            k = k.replace("patch_embed.", "patch_embed.proj.")
+
+        # timm doesn't need relative_position_index or attention mask
+        if "relative_position_index" in k or "attn_mask" in k:
+            continue
+
+        if k == "patch_embed.proj.weight" and v.shape[1] == 1:
+            # v shape: [96, 1, 4, 4] → replicate along input channel dim
+            v = v.repeat(1, 3, 1, 1) / 3.0  # average scale to balance energy
+            print("→ Expanded patch_embed.proj.weight from 1-channel to 3-channel")
+
+        new_state_dict[k] = v
+
+    print(f"Converted {len(new_state_dict)} parameters ready to load.")
+    return new_state_dict
+
 def train_worker(
     local_rank: int,
     world_size: int,
@@ -180,26 +253,26 @@ def pretrain(config_path: str):
     if 'mae' not in config:
         raise ValueError("Configuration file missing 'mae' section")
     
+    # Convert any parameters that might have inconsistent naming
+    # Convert 'learning_rate' to 'lr' if needed elsewhere in the code
+    if 'learning_rate' in config['mae'] and 'lr' not in config['mae']:
+        config['mae']['lr'] = config['mae']['learning_rate']
+    
     # Create save directory
     os.makedirs(config['mae']['save_dir'], exist_ok=True)
     
     try:
+        # All the commented code remains the same
+        # ...existing code...
+        
         # Run pretraining
-        metrics = pretrain_mae(config)
+        pretrain_mae(config)
         
         print("MAE pretraining completed!")
-        # Safely get minimum validation loss
-        val_losses = [m['val_loss'] for m in metrics if 'val_loss' in m]
-        if val_losses:
-            best_val_loss = min(val_losses)
-            print(f"Best validation loss: {best_val_loss:.4f}")
-        else:
-            print("Warning: No validation metrics were recorded during training")
         print(f"Encoder weights saved to: {config['mae']['save_dir']}/best_encoder.pth")
     except Exception as e:
         print(f"Error during MAE pretraining: {str(e)}")
         raise
-
 
 def train(config_path: str):
     """Run training pipeline."""
@@ -232,17 +305,19 @@ def train(config_path: str):
         
         # Create model
         model = SaltSegmentationModel(
-            img_size=config['model']['img_size'],
-            in_channels=3 if config['data']['use_2_5d'] else 1,
-            embed_dim=config['model']['embed_dim'],
-            depths=config['model']['depths'],
-            num_heads=config['model']['num_heads'],
-            window_size=config['model']['window_size'],
-            dropout_rate=config['model']['dropout_rate'],
-            use_checkpoint=config['model']['use_checkpoint'],
-            pretrained_encoder=config['model']['mae_checkpoint'] if config['model']['mae_pretrained'] else None
+            model_name=config['model']['swin_variant'],
+            in_channels=config['model']['in_channels'],
+            seg_out_channels=config['model']['seg_out_channels'],
+            cls_out_channels=config['model']['cls_out_channels'],
+            pretrained=config['model']['pretrained']
         )
-        
+
+        if config['model'].get('mae_pretrained', False):
+            mae_ckpt_path = config['model']['mae_checkpoint']
+            print(f"Loading MAE-pretrained Swin encoder from: {mae_ckpt_path}")
+            state_dict = convert_mae_checkpoint_for_timm(config['model']['mae_checkpoint'])
+            model.encoder.backbone.load_state_dict(state_dict, strict=False)    
+
         # Create trainer
         trainer = Trainer(
             model=model,
@@ -277,19 +352,16 @@ def train_refinement(config_path: str):
     
     # 4. Load main model for generating predictions on validation set
     main_model = SaltSegmentationModel(
-        img_size=config['model']['img_size'],
-        in_channels=3 if config['data']['use_2_5d'] else 1,
-        embed_dim=config['model']['embed_dim'],
-        depths=config['model']['depths'],
-        num_heads=config['model']['num_heads'],
-        window_size=config['model']['window_size'],
-        dropout_rate=config['model']['dropout_rate']
+        model_name=config['model']['swin_variant'],
+        in_channels=config['model']['in_channels'],
+        seg_out_channels=config['model']['seg_out_channels'],
+        cls_out_channels=config['model']['cls_out_channels'],
+        pretrained=config['model']['pretrained']
     )
     
-    # Load checkpoint
-    main_checkpoint_path = config['refinement'].get('main_model_checkpoint')
-    if not main_checkpoint_path:
-        raise ValueError("Please specify 'main_model_checkpoint' in the refinement config section")
+    # Use find_checkpoint to get the latest best model
+    main_checkpoint_path = find_checkpoint(config)
+    print(f"Loading main model from: {main_checkpoint_path}")
     
     checkpoint = torch.load(main_checkpoint_path, map_location=device)
     state_dict = checkpoint['model_state_dict']
@@ -393,10 +465,12 @@ def train_refinement(config_path: str):
     print(f"Refinement model trained and saved to: {checkpoint_path}")
 
 
-def predict(config_path: str, checkpoint_path: str):
+def predict(config_path: str):
     """Run inference pipeline."""
     # Load configuration
     config = load_config(config_path)
+    checkpoint_path = find_checkpoint(config)
+    print(f"Using checkpoint: {checkpoint_path}")
     
     # Set device
     device = torch.device(config['training'].get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
@@ -547,8 +621,6 @@ def main():
     parser.add_argument('--mode', type=str, required=True,
                       choices=['pretrain', 'train', 'predict', 'train_refinement'],
                       help='Run mode')
-    parser.add_argument('--checkpoint', type=str,
-                      help='Path to model checkpoint (for prediction)')
     
     args = parser.parse_args()
     
@@ -559,9 +631,7 @@ def main():
     elif args.mode == 'train_refinement':
         train_refinement(args.config)
     elif args.mode == 'predict':
-        if args.checkpoint is None:
-            raise ValueError("Checkpoint path required for prediction mode")
-        predict(args.config, args.checkpoint)
+        predict(args.config)
 
 
 if __name__ == '__main__':

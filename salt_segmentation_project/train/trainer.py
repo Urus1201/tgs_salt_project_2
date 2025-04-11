@@ -10,6 +10,7 @@ import numpy as np
 from tqdm import tqdm
 from typing import Dict, Optional, Tuple
 from pathlib import Path
+import time
 
 from models.segmentation_model import SaltSegmentationModel
 from losses.combined_loss import CombinedLoss
@@ -126,19 +127,25 @@ class Trainer:
         # Validate data paths
         self._validate_data_paths()
 
+        # Initialize gradient scaler for mixed precision
+        self.scaler = torch.cuda.amp.GradScaler(enabled=config['training'].get('amp', True))
+
     def _validate_data_paths(self):
         """Validate that data directories exist before starting training."""
         if not self.distributed or self.local_rank == 0:
             try:
-                # Get correct data path by checking both absolute and relative paths
-                data_path = Path(self.config.get('data', {}).get('data_dir', '/root/tgs_salt_mode_2/data'))
+                # Get data path from config, using the correct key 'base_dir'
+                data_path = Path(self.config.get('data', {}).get('base_dir', '/root/tgs_salt_mode_2/data'))
+                
+                # Handle paths properly - don't try to make absolute paths relative
                 if not data_path.is_absolute():
-                    # Try relative to the project root
-                    project_root = Path(__file__).resolve().parents[1]
-                    data_path = project_root / data_path
-
-                train_images_path = data_path / 'train' / 'images'
-                train_masks_path = data_path / 'train' / 'masks'
+                    # If it's a relative path, make it absolute from current directory
+                    data_path = Path.cwd() / data_path
+                
+                # Form paths to training data directories
+                train_dir = data_path / self.config.get('data', {}).get('train_dir', 'train')
+                train_images_path = data_path / self.config.get('data', {}).get('train_images', 'train/images')
+                train_masks_path = data_path / self.config.get('data', {}).get('train_masks', 'train/masks')
                 
                 paths_to_check = [
                     (data_path, "Data directory"),
@@ -191,6 +198,11 @@ class Trainer:
         # Track skipped batches due to errors
         skipped_batches = 0
         
+        use_amp = self.config['training'].get('amp', True) and torch.cuda.is_available()
+        data_times = []
+        compute_times = []
+        start_time = time.time()
+        
         for batch_idx, batch_data in enumerate(pbar):
             try:
                 images, masks = batch_data
@@ -202,8 +214,11 @@ class Trainer:
                 # Create classification targets from masks
                 cls_target = (masks.sum(dim=(2,3)) > 0).float()
                 
+                data_end_time = time.time()
+                data_times.append(data_end_time - start_time)
+                
                 # Forward pass with automatic mixed precision
-                with torch.amp.autocast('cuda'):
+                with torch.amp.autocast('cuda', enabled=use_amp):
                     seg_logits, cls_logits = self.model(images)
                 seg_logits = F.interpolate(seg_logits, size=masks.shape[2:], mode='bilinear', align_corners=False)
                 loss, loss_dict = self.criterion(
@@ -213,13 +228,19 @@ class Trainer:
                 
                 # Backward pass with gradient scaling
                 self.optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
+                self.scaler.scale(loss).backward()
                 if self.config['training'].get('grad_clip', 0) > 0:
+                    self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
                         self.config['training']['grad_clip']
                     )
-                loss.backward()
-                self.optimizer.step()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                
+                compute_end_time = time.time()
+                compute_times.append(compute_end_time - data_end_time)
+                start_time = time.time()
                 
                 # Calculate metrics
                 metrics = self.criterion.compute_metrics(
@@ -274,6 +295,10 @@ class Trainer:
         # Log metrics (main process only)
         if not self.distributed or self.local_rank == 0:
             self.logger.log_metrics(avg_metrics, phase='train', epoch=self.current_epoch)
+            self.logger.logger.info(
+                f"Avg data loading time: {np.mean(data_times):.4f}s, "
+                f"Avg compute time: {np.mean(compute_times):.4f}s"
+            )
         
         return avg_metrics
         
@@ -477,6 +502,19 @@ class Trainer:
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.current_epoch = checkpoint['epoch']
         self.best_metric = checkpoint.get('val_iou', 0.0)
+        
+        # Verify model compatibility
+        if 'model_config' in checkpoint:
+            current_config = {
+                'embed_dim': self.model.embed_dim,
+                'depths': self.model.depths,
+                'num_heads': self.model.num_heads
+            }
+            saved_config = checkpoint['model_config']
+            if current_config != saved_config:
+                self.logger.logger.warning(
+                    f"Model configuration mismatch. Current: {current_config}, Saved: {saved_config}"
+                )
         
         if not self.distributed or self.local_rank == 0:
             self.logger.logger.info(f"Loaded checkpoint from epoch {self.current_epoch+1}")

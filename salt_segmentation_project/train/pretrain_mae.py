@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader
 import numpy as np
 from typing import Dict, Optional, Tuple
 import os
+from tqdm import tqdm  # Added tqdm import
 
 from models.encoder_swin import SwinEncoder
 from models.mae_decoder import MAEDecoder
@@ -20,10 +21,16 @@ class MAEPretrainer:
         val_loader: Optional[DataLoader] = None,
         device: str = 'cuda'
     ):
+        """
+        - encoder: A SwinEncoder that already handles patch embedding internally.
+        - decoder: A MAEDecoder that expects [B, L, hidden_dim] from the encoder.
+        """
         self.encoder = encoder.to(device)
         self.decoder = MAEDecoder(
-            patch_size=encoder.patch_size,
-            in_channels=1,  # Single channel for MAE pretraining
+            # In your original code, these come from config['mae'].
+            # The patch_size=... is not used directly here (we rely on the encoder).
+            patch_size=config['mae']['patch_size'],  # Use config instead of encoder.patch_size
+            in_channels=1,  # single channel for grayscale
             encoder_embed_dim=encoder.embed_dim,
             decoder_embed_dim=config['mae']['decoder_embed_dim'],
             decoder_depth=config['mae']['decoder_depth'],
@@ -38,11 +45,11 @@ class MAEPretrainer:
         # Initialize optimizer
         self.optimizer = torch.optim.AdamW(
             list(self.encoder.parameters()) + list(self.decoder.parameters()),
-            lr=config['mae']['lr'],
+            lr=config['mae']['learning_rate'],  # Changed from 'lr' to 'learning_rate'
             weight_decay=config['mae']['weight_decay']
         )
         
-        # For logging
+        # For logging/early stopping
         self.best_val_loss = float('inf')
     
     def random_masking(
@@ -51,76 +58,55 @@ class MAEPretrainer:
         mask_ratio: float = 0.75
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Perform per-sample random masking by per-sample shuffling.
-        Per-sample shuffling is done by argsort random noise.
-        x: [N, L, D], sequence
+        Perform random masking on the sequence of patch embeddings x, shape [B, L, D].
+        Returns:
+          x_masked: masked embeddings, shape [B, L*(1 - mask_ratio), D]
+          mask: shape [B, L], with 1 where patches were removed
+          ids_restore: used for un-shuffling if needed
         """
-        N, L, D = x.shape  # batch, length, dim
+        B, L, D = x.shape
         len_keep = int(L * (1 - mask_ratio))
         
-        noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
-        
-        # sort noise for each sample
-        ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
+        # Shuffle each sample's patches by random noise
+        noise = torch.rand(B, L, device=x.device)
+        ids_shuffle = torch.argsort(noise, dim=1)
         ids_restore = torch.argsort(ids_shuffle, dim=1)
         
-        # keep the first subset
+        # Keep only the first "len_keep" patches in each sample
         ids_keep = ids_shuffle[:, :len_keep]
         x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
         
-        # generate the binary mask: 0 is keep, 1 is remove
-        mask = torch.ones([N, L], device=x.device)
+        # Binary mask: 0 is keep, 1 is remove
+        mask = torch.ones([B, L], device=x.device)
         mask[:, :len_keep] = 0
-        # unshuffle to get the binary mask
         mask = torch.gather(mask, dim=1, index=ids_restore)
         
         return x_masked, mask, ids_restore
 
-    def patchify(self, imgs: torch.Tensor) -> torch.Tensor:
-        """Convert a batch of images to a sequence of patches."""
-        p = self.encoder.patch_size
-        c = 1  # number of channels (1 for MAE pretraining)
+    def forward_loss(self, imgs: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
+        """
+        1. Pass the full images through the SwinEncoder to get patch embeddings [B, L, D].
+        2. Randomly mask them, get x_masked, plus 'mask' for which patches were removed.
+        3. Decoder reconstructs all L patches in that embedding space -> pred [B, L, D].
+        4. MSE loss only for the masked patches.
+        """
+        # Step 1: The encoder does patch embed + forward
+        # Make sure your images are already padded to multiples of patch_size if needed
+        x = self.encoder.forward_features(imgs)  # shape [B, L, embed_dim]
         
-        x = imgs.reshape(shape=(imgs.shape[0], c, imgs.shape[2] // p, p, imgs.shape[3] // p, p))
-        x = torch.einsum('nchpwq->nhwpqc', x)
-        x = x.reshape(shape=(imgs.shape[0], -1, p**2 * c))
-        return x
-    
-    def unpatchify(self, x: torch.Tensor, h: int, w: int) -> torch.Tensor:
-        """Convert a sequence of patches back to an image."""
-        p = self.encoder.patch_size
-        c = 1
-        
-        x = x.reshape(shape=(x.shape[0], h // p, w // p, p, p, c))
-        x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], c, h, w))
-        return imgs
-
-    def forward_loss(self, samples: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
-        """Forward pass with masking and loss computation."""
-        # Get patches
-        x = self.patchify(samples)
-        
-        # Add positional encoding in encoder
-        x = self.encoder.prepare_tokens(x)
-        
-        # Random masking
+        # Step 2: Random masking in embedding space
         x_masked, mask, ids_restore = self.random_masking(
             x, self.config['mae']['mask_ratio']
         )
         
-        # Encode visible patches
-        latent = self.encoder.forward_features(x_masked)
+        # Step 3: Decode (reconstruct) all L patches
+        pred = self.decoder(x_masked, ids_restore)  # shape [B, L, D]
         
-        # Decode all patches
-        pred = self.decoder(latent, mask)
-        
-        # Unpatchify
-        pred = self.unpatchify(pred, samples.shape[2], samples.shape[3])
-        
-        # Compute loss only on masked patches
-        loss = F.mse_loss(pred, samples, reduction='none')
-        loss = (loss * mask.unsqueeze(1)).mean()
+        # Step 4: MSE loss over the masked patches only
+        # Expand mask to [B, L, 1] to match [B, L, D]
+        mask_3d = mask.unsqueeze(-1)  # shape [B, L, 1]
+        loss = (pred - x) ** 2
+        loss = (loss * mask_3d).mean()  # average only the masked patches
         
         return loss, {
             'loss': loss.item(),
@@ -128,30 +114,37 @@ class MAEPretrainer:
         }
 
     def train_epoch(self) -> Dict[str, float]:
-        """Train for one epoch."""
+        """
+        Training for one epoch. We only need the images; masks are not used for MAE.
+        """
         self.encoder.train()
         self.decoder.train()
         
         total_loss = 0
-        for imgs, _ in self.train_loader:  # Unpack image from tuple, ignore mask
+        # Add progress bar for batches
+        pbar = tqdm(self.train_loader, desc="Training", leave=False)
+        for imgs, _ in pbar:
             if isinstance(imgs, torch.Tensor):
-                imgs = imgs[:, 0:1].to(self.device)  # Take only first channel for MAE
+                imgs = imgs.to(self.device)
                 
-                # Forward pass and loss
                 loss, metrics = self.forward_loss(imgs)
                 
-                # Backward pass
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
                 
                 total_loss += metrics['loss']
+                
+                # Update progress bar description with current loss
+                pbar.set_postfix({"loss": f"{metrics['loss']:.4f}"})
         
         return {'train_loss': total_loss / len(self.train_loader)}
 
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
-        """Validate the current model."""
+        """
+        Validation loop. Same logic as training but no backward/optim.
+        """
         if self.val_loader is None:
             return {}
             
@@ -159,11 +152,17 @@ class MAEPretrainer:
         self.decoder.eval()
         
         total_loss = 0
-        for imgs, _ in self.val_loader:  # Unpack image from tuple, ignore mask
+        # Add progress bar for validation
+        pbar = tqdm(self.val_loader, desc="Validating", leave=False)
+        for imgs, _ in pbar:
             if isinstance(imgs, torch.Tensor):
-                imgs = imgs[:, 0:1].to(self.device)
+                imgs = imgs.to(self.device)
+                
                 loss, metrics = self.forward_loss(imgs)
                 total_loss += metrics['loss']
+                
+                # Fix: use metrics['loss'] instead of metrics['val_loss']
+                pbar.set_postfix({"val_loss": f"{metrics['loss']:.4f}"})
         
         return {'val_loss': total_loss / len(self.val_loader)}
 
@@ -173,67 +172,78 @@ class MAEPretrainer:
         save_dir: str,
         early_stop_patience: int = 10
     ) -> Dict:
-        """Full training loop with validation and early stopping."""
+        """
+        Full training loop with optional early stopping.
+        """
         patience_counter = 0
         train_metrics = []
         
-        for epoch in range(num_epochs):
-            # Train
+        # Add an outer progress bar for epochs
+        epoch_pbar = tqdm(range(num_epochs), desc="MAE Pretraining")
+        for epoch in epoch_pbar:
             metrics = self.train_epoch()
             
-            # Validate
             if self.val_loader is not None:
                 val_metrics = self.validate()
                 metrics.update(val_metrics)
                 
-                # Early stopping check
                 val_loss = val_metrics['val_loss']
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
-                    self.save_encoder(f"{save_dir}/best_encoder.pth")
+                    self.save_encoder(os.path.join(save_dir, "best_encoder.pth"))
                     patience_counter = 0
                 else:
                     patience_counter += 1
                 
                 if patience_counter >= early_stop_patience:
-                    print(f"Early stopping triggered after {epoch + 1} epochs")
+                    epoch_pbar.write(f"Early stopping triggered after {epoch + 1} epochs")
                     break
             
-            print(f"Epoch {epoch + 1}/{num_epochs}:", end=" ")
-            print(", ".join(f"{k}: {v:.4f}" for k, v in metrics.items()))
+            # Update epoch progress bar with metrics
+            epoch_pbar.set_postfix({k: f"{v:.4f}" for k, v in metrics.items()})
+            
+            # Still log to console but use tqdm's write to prevent progress bar interference
+            epoch_pbar.write(f"Epoch {epoch+1}/{num_epochs}: " + ", ".join(f"{k}: {v:.4f}" for k, v in metrics.items()))
             train_metrics.append(metrics)
         
         return train_metrics
 
     def save_encoder(self, path: str):
-        """Save only the encoder weights for later use in segmentation."""
+        """Saves only the encoder weights."""
         torch.save(self.encoder.state_dict(), path)
 
 
 def pretrain_mae(config: Dict):
-    """Main function to run MAE pretraining."""
-    # Initialize encoder
+    """
+    Main function to run MAE pretraining with the above classes.
+    - We assume you have a SwinEncoder that does patch embedding internally.
+    - We pass the full images in, and rely on that to produce [B, L, D].
+    """
+    # 1) Initialize encoder
     encoder = SwinEncoder(
-        img_size=config['model']['img_size'],
-        patch_size=4,  # Fixed for MAE
-        in_channels=1,  # Single channel for pretraining
-        embed_dim=config['model']['embed_dim'],
-        depths=config['model']['depths'],
-        num_heads=config['model']['num_heads'],
-        window_size=config['model']['window_size'],
-        drop_path_rate=0.1
+        model_name=config['mae'].get('model_name', 'microsoft/swin-tiny-patch4-window7-224'),
+        pretrained=config['mae'].get('pretrained', False),
+        in_channels=config['mae']['in_channels']
     )
     
-    # Setup data
-    train_dataset = SaltDataset(
+    # 2) Setup data with train/val split
+    full_dataset = SaltDataset(
         csv_file=os.path.join(config['data']['base_dir'], config['data']['train_csv']),
         image_dir=os.path.join(config['data']['base_dir'], config['data']['train_images']),
-        mask_dir=None,  # No masks needed for MAE pretraining
-        depths_csv=None,  # Depths not used for MAE
-        transform=None,  # Add transforms if needed
-        use_2_5d=False,  # Single channel for MAE
-        mode='test'  # Use test mode to avoid loading masks
+        mask_dir=None,   # no masks needed for MAE
+        depths_csv=None, # not needed for MAE
+        transform=None,  # you can add padding transform here if you like
+        use_2_5d=False,  # single channel
+        mode='test'      # so it won't load actual segmentation masks
     )
+    
+    # Split into train/val
+    train_size = int(0.9 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_dataset, [train_size, val_size]
+    )
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['mae']['batch_size'],
@@ -241,15 +251,23 @@ def pretrain_mae(config: Dict):
         num_workers=config['data']['num_workers']
     )
     
-    # Initialize trainer
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config['mae']['batch_size'],
+        shuffle=False,
+        num_workers=config['data']['num_workers']
+    )
+    
+    # 3) Initialize the pretrainer
     trainer = MAEPretrainer(
         encoder=encoder,
         config=config,
         train_loader=train_loader,
-        device=config['training']['device']
+        val_loader=val_loader,
+        device=config['mae']['device']  # Changed from 'training.device' to 'mae.device'
     )
     
-    # Train
+    # 4) Train
     metrics = trainer.train(
         num_epochs=config['mae']['num_epochs'],
         save_dir=config['mae']['save_dir'],

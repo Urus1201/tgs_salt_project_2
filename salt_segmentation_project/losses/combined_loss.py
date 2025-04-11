@@ -129,6 +129,15 @@ class CombinedLoss(nn.Module):
         dice = (2 * intersection + 1e-6) / (union + intersection + 1e-6)
         mean_dice = dice.mean().item()
         
+        # Handle edge case for empty ground truth masks
+        if (seg_target.sum(dim=(1, 2, 3)) == 0).all():
+            if (torch.sigmoid(seg_logits) < 0.5).all():
+                mean_iou = 1.0
+                mean_dice = 1.0
+            else:
+                mean_iou = 0.0
+                mean_dice = 0.0
+        
         # Calculate classification accuracy
         cls_acc = (cls_pred == cls_target).float().mean().item()
         

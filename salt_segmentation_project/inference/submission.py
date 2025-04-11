@@ -156,5 +156,7 @@ class SubmissionGenerator:
         intersection = (decoded_mask & original_mask).sum()
         union = (decoded_mask | original_mask).sum()
         
-        iou = intersection / (union + 1e-6)
+        if union == 0:  # Both masks are empty
+            return 1.0  # Perfect match
+        iou = intersection / union
         return iou

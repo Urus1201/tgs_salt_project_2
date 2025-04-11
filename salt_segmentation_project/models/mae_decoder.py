@@ -17,6 +17,8 @@ class MAEDecoder(nn.Module):
         super().__init__()
         self.patch_size = patch_size
         self.in_channels = in_channels
+        self.decoder_embed_dim = decoder_embed_dim  # Store as instance variable
+        self.encoder_embed_dim = encoder_embed_dim  # Store encoder dim for prediction
         
         # Embed tokens for masked patches (learnable)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
@@ -38,51 +40,39 @@ class MAEDecoder(nn.Module):
         
         self.decoder_norm = nn.LayerNorm(decoder_embed_dim)
         
-        # Predict original patches
+        # Predict patches in encoder embedding space for reconstruction
         self.decoder_pred = nn.Linear(
-            decoder_embed_dim, patch_size * patch_size * in_channels, bias=True
+            decoder_embed_dim, encoder_embed_dim, bias=True
         )
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, ids_restore: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: Encoded features from visible patches [B, N_visible, C]
-            mask: Boolean mask indicating masked patches [B, N_total], True = masked
+            ids_restore: Indices to restore the original order of patches [B, N_total]
         Returns:
-            Reconstructed image patches [B, N_total, patch_size*patch_size*in_channels]
+            Reconstructed image patches [B, N_total, encoder_embed_dim]
         """
-        B, N_visible, C = x.shape
-        N_total = mask.shape[1]  # Total number of patches (676 for 26x26 grid)
+        B, N_vis, C = x.shape
+        N_total = ids_restore.shape[1]  # Total number of patches
         
-        # Project encoder features to decoder dim
+        # embed tokens
         x = self.decoder_embed(x)
         
-        # Create mask tokens for all patches
-        mask_tokens = self.mask_token.expand(B, N_total, -1)
+        # append mask tokens
+        mask_tokens = self.mask_token.repeat(B, N_total - N_vis, 1)
+        x_ = torch.cat([x, mask_tokens], dim=1)  # no cls token
+        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, self.decoder_embed_dim))  # unshuffle
         
-        # Create empty tensor for all patches
-        full_x = torch.zeros((B, N_total, x.shape[-1]), device=x.device)
+        # decoder blocks
+        for blk in self.decoder_blocks:
+            x_ = blk(x_)
         
-        # Ensure mask is boolean type and get visible indices
-        bool_mask = mask.bool()
-        visible_idx = torch.nonzero(~bool_mask)[:,1][:N_visible]  # Get indices of visible patches
+        # decoder to patch
+        x_ = self.decoder_norm(x_)
+        x_ = self.decoder_pred(x_)
         
-        # Put visible patches in their correct positions
-        full_x[:, visible_idx] = x
-        
-        # Add mask tokens for masked positions
-        w = bool_mask.unsqueeze(-1).type_as(mask_tokens)
-        x = full_x * (1 - w) + mask_tokens * w
-        
-        # Apply transformer blocks
-        for block in self.decoder_blocks:
-            x = block(x)
-        x = self.decoder_norm(x)
-        
-        # Predict pixel values for each patch
-        x = self.decoder_pred(x)
-        
-        return x
+        return x_
 
 class TransformerBlock(nn.Module):
     """Basic Transformer block with self-attention and MLP."""
@@ -109,7 +99,7 @@ class TransformerBlock(nn.Module):
             nn.Linear(mlp_hidden_dim, dim)
         )
 
-    def _forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward(self, x: torch.Tensor) -> torch.Tensor: #or) -> torch.Tensor:
         x = x + self.attn(self.norm1(x), self.norm1(x), self.norm1(x))[0]
         x = x + self.mlp(self.norm2(x))
         return x
