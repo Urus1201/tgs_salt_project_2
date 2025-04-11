@@ -22,6 +22,7 @@ from inference.submission import SubmissionGenerator, mask_to_rle
 from inference.refinement import RefinementNet, UncertaintyRefinement, train_refinement_model
 from utils.path_utils import prepare_data_paths
 from utils.find_checkpoint import find_checkpoint
+from tqdm import tqdm  # import already present
 
 
 def load_config(config_path: str) -> Dict:
@@ -131,7 +132,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, vis_dir=None):
     """Train model for one epoch."""
     model.train()
     total_loss = 0.0
-    for batch_idx, (images, _) in enumerate(dataloader):
+    for batch_idx, (images, _) in enumerate(tqdm(dataloader, desc=f"Training Epoch {epoch}")):
         images = images.to(device)
         optimizer.zero_grad()
         outputs = model(images)
@@ -147,7 +148,7 @@ def validate(model, dataloader, device, epoch, vis_dir=None):
     model.eval()
     total_loss = 0.0
     with torch.no_grad():
-        for batch_idx, (images, _) in enumerate(dataloader):
+        for batch_idx, (images, _) in enumerate(tqdm(dataloader, desc=f"Validation Epoch {epoch}")):
             images = images.to(device)
             outputs = model(images)
             loss = outputs['loss']
@@ -480,13 +481,11 @@ def predict(config_path: str):
     
     # Create model and load checkpoint
     model = SaltSegmentationModel(
-        img_size=config['model']['img_size'],
-        in_channels=3 if config['data']['use_2_5d'] else 1,
-        embed_dim=config['model']['embed_dim'],
-        depths=config['model']['depths'],
-        num_heads=config['model']['num_heads'],
-        window_size=config['model']['window_size'],
-        dropout_rate=config['model']['dropout_rate']
+        model_name=config['model']['swin_variant'],
+        in_channels=config['model']['in_channels'],
+        seg_out_channels=config['model']['seg_out_channels'],
+        cls_out_channels=config['model']['cls_out_channels'],
+        pretrained=config['model']['pretrained']
     )
     
     # Handle distributed checkpoint if needed
@@ -551,7 +550,7 @@ def predict(config_path: str):
         predictions_list = []
         image_ids = []
         
-        for images, batch_ids in test_loader:
+        for images, batch_ids in tqdm(test_loader, desc="Inference"):
             # Get predictions with uncertainty
             predictions = predictor.predict_batch(images)
             
