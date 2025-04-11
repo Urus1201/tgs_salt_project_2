@@ -77,31 +77,64 @@ def plot_prediction_grid(
     )
     
     for idx in range(num_examples):
+        # Process the image based on its current format
+        img = images[idx]
+        if isinstance(img, np.ndarray):
+            if len(img.shape) == 3:
+                if img.shape[0] in [1, 3]:  # CHW format
+                    img = np.transpose(img, (1, 2, 0))
+                # Otherwise assume it's already in HWC format
+            if len(img.shape) > 2 and img.shape[-1] == 1:  # Remove singleton dimensions
+                img = img.squeeze(-1)
+        
+        # Process the mask
+        mask = masks[idx]
+        if isinstance(mask, np.ndarray) and len(mask.shape) > 2:
+            if mask.shape[0] == 1:  # CHW format with single channel
+                mask = mask.squeeze(0)
+            elif mask.shape[-1] == 1:  # HWC format with single channel
+                mask = mask.squeeze(-1)
+        
+        # Process the prediction
+        pred = predictions[idx]
+        if isinstance(pred, np.ndarray) and len(pred.shape) > 2:
+            if pred.shape[0] == 1:  # CHW format with single channel
+                pred = pred.squeeze(0)
+            elif pred.shape[-1] == 1:  # HWC format with single channel
+                pred = pred.squeeze(-1)
+        
         # Plot original image
-        axes[idx, 0].imshow(np.moveaxis(images[idx], 0, -1))
+        axes[idx, 0].imshow(img, cmap='gray' if len(img.shape) == 2 else None)
         axes[idx, 0].set_title('Input')
         axes[idx, 0].axis('off')
         
         # Plot ground truth mask
-        axes[idx, 1].imshow(masks[idx].squeeze(0), cmap='gray')
+        axes[idx, 1].imshow(mask, cmap='gray')
         axes[idx, 1].set_title('Ground Truth')
         axes[idx, 1].axis('off')
         
         # Plot prediction
-        axes[idx, 2].imshow(predictions[idx].squeeze(0), cmap='gray')
+        axes[idx, 2].imshow(pred, cmap='gray')
         axes[idx, 2].set_title('Prediction')
         axes[idx, 2].axis('off')
         
         # Plot uncertainty if available
         if uncertainties is not None:
-            axes[idx, 3].imshow(uncertainties[idx].squeeze(0), cmap='magma')
+            uncert = uncertainties[idx]
+            if isinstance(uncert, np.ndarray) and len(uncert.shape) > 2:
+                if uncert.shape[0] == 1:  # CHW format with single channel
+                    uncert = uncert.squeeze(0)
+                elif uncert.shape[-1] == 1:  # HWC format with single channel
+                    uncert = uncert.squeeze(-1)
+            
+            axes[idx, 3].imshow(uncert, cmap='magma')
             axes[idx, 3].set_title('Uncertainty')
             axes[idx, 3].axis('off')
             
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path)
-    plt.close()
+    plt.show()  # Changed from plt.close() to actually display the plot
 
 
 def plot_boundary_refinement(
@@ -318,3 +351,599 @@ def visualize_predictions(submission_path, test_images_dir, num_samples=5):
         axes[1].axis('off')
 
         plt.show()
+
+def create_overlay(image, mask, alpha=0.5, mask_color=[1, 0, 0]):
+    """
+    Create an overlay of the mask on the image.
+    
+    Args:
+        image: Grayscale or RGB image array
+        mask: Binary mask array
+        alpha: Transparency of the overlay (0-1)
+        mask_color: Color of the mask overlay in RGB
+    
+    Returns:
+        Overlay image
+    """
+    # Ensure image is in the range [0, 1]
+    if image.max() > 1:
+        image = image / 255.0
+    
+    # Handle different image and mask shapes
+    if len(image.shape) == 2:  # Convert grayscale to RGB
+        image_rgb = np.stack([image] * 3, axis=-1)
+    elif len(image.shape) == 3 and image.shape[0] in [1, 3]:  # CHW format
+        image = np.transpose(image, (1, 2, 0))
+        if image.shape[-1] == 1:
+            image = image.squeeze(-1)
+            image_rgb = np.stack([image] * 3, axis=-1)
+        else:
+            image_rgb = image
+    else:
+        image_rgb = image
+        
+    # Normalize mask to be binary
+    if len(mask.shape) > 2:
+        mask = mask.squeeze()
+    
+    # Create colored mask
+    colored_mask = np.zeros_like(image_rgb)
+    colored_mask[..., 0] = mask * mask_color[0]
+    colored_mask[..., 1] = mask * mask_color[1]
+    colored_mask[..., 2] = mask * mask_color[2]
+    
+    # Create overlay
+    overlay = image_rgb * (1 - alpha) + colored_mask * alpha
+    
+    # Clip values to be between 0 and 1
+    overlay = np.clip(overlay, 0, 1)
+    
+    return overlay
+
+def visualize_refinement_comparison(
+    images: List[np.ndarray],
+    masks: List[np.ndarray],
+    original_preds: List[np.ndarray],
+    refined_preds: List[np.ndarray],
+    uncertainties: Optional[List[np.ndarray]] = None,
+    num_examples: int = 4,
+    save_path: str = None
+) -> None:
+    """
+    Visualize a grid comparing original and refined predictions.
+    
+    Args:
+        images: List of input images
+        masks: List of ground truth masks
+        original_preds: List of original prediction masks
+        refined_preds: List of refined prediction masks
+        uncertainties: Optional list of uncertainty maps
+        num_examples: Number of examples to plot
+        save_path: Path to save the plot
+    """
+    fig, axes = plt.subplots(
+        num_examples, 
+        5 if uncertainties else 4, 
+        figsize=(20, 5*num_examples)
+    )
+    
+    for i in range(num_examples):
+        # Process images for visualization
+        img = images[i]
+        if isinstance(img, np.ndarray) and img.shape[0] in [1, 3]:
+            img = np.transpose(img, (1, 2, 0))
+        if len(img.shape) > 2 and img.shape[-1] == 1:
+            img = img.squeeze(-1)
+            
+        # Original image
+        axes[i, 0].imshow(img, cmap='gray' if len(img.shape) == 2 else None)
+        axes[i, 0].set_title('Input Image')
+        axes[i, 0].axis('off')
+        
+        # Ground truth
+        gt = masks[i]
+        if len(gt.shape) > 2:
+            gt = gt.squeeze()
+        axes[i, 1].imshow(gt, cmap='gray')
+        axes[i, 1].set_title('Ground Truth')
+        axes[i, 1].axis('off')
+        
+        # Original prediction
+        orig_pred = original_preds[i]
+        if len(orig_pred.shape) > 2:
+            orig_pred = orig_pred.squeeze()
+        axes[i, 2].imshow(orig_pred, cmap='gray')
+        axes[i, 2].set_title('Original Prediction')
+        axes[i, 2].axis('off')
+        
+        # Refined prediction
+        ref_pred = refined_preds[i]
+        if len(ref_pred.shape) > 2:
+            ref_pred = ref_pred.squeeze()
+        axes[i, 3].imshow(ref_pred, cmap='gray')
+        axes[i, 3].set_title('Refined Prediction')
+        axes[i, 3].axis('off')
+        
+        # Uncertainty if provided
+        if uncertainties:
+            uncert = uncertainties[i]
+            if len(uncert.shape) > 2:
+                uncert = uncert.squeeze()
+            axes[i, 4].imshow(uncert, cmap='magma')
+            axes[i, 4].set_title('Uncertainty')
+            axes[i, 4].axis('off')
+    
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path)
+    plt.show()
+
+def visualize_gradcam(
+    model,
+    image,
+    target_layer,
+    target_class=None,
+    mask=None,
+    save_path=None
+):
+    """
+    Visualize GradCAM for model explanation.
+    
+    Args:
+        model: PyTorch model
+        image: Input image tensor (C,H,W)
+        target_layer: Target layer for GradCAM
+        target_class: Target class for GradCAM (None for segmentation)
+        mask: Optional ground truth mask
+        save_path: Path to save the visualization
+    """
+    try:
+        from pytorch_grad_cam import GradCAM, GradCAMPlusPlus
+        from pytorch_grad_cam.utils.image import show_cam_on_image
+    except ImportError:
+        print("Please install pytorch-grad-cam: pip install pytorch-grad-cam")
+        return
+        
+    # Create a simple wrapper for the model if necessary
+    class ModelWrapper(torch.nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+            
+        def forward(self, x):
+            preds = self.model(x)
+            if isinstance(preds, tuple):
+                return preds[0]  # Assume segmentation prediction is first output
+            elif isinstance(preds, dict):
+                return preds['seg_pred']  # Assume it's in a dict with this key
+            return preds
+    
+    wrapped_model = ModelWrapper(model)
+    
+    # Setup GradCAM
+    cam = GradCAM(
+        model=wrapped_model, 
+        target_layers=[target_layer],
+        use_cuda=next(model.parameters()).is_cuda
+    )
+    
+    # Preprocess image if it's not already a tensor
+    if isinstance(image, np.ndarray):
+        if image.shape[0] not in [1, 3]:  # Not in CHW format
+            if len(image.shape) == 3:
+                image = np.transpose(image, (2, 0, 1))
+            else:
+                image = np.expand_dims(image, 0)  # Add channel dim
+        image_tensor = torch.from_numpy(image.copy()).float().unsqueeze(0)
+    else:
+        image_tensor = image.clone().unsqueeze(0) if image.dim() == 3 else image.clone()
+    
+    # Generate GradCAM
+    grayscale_cam = cam(input_tensor=image_tensor, target_category=target_class)
+    grayscale_cam = grayscale_cam[0, :]
+    
+    # Convert image for visualization
+    if isinstance(image, torch.Tensor):
+        image_for_vis = image.cpu().numpy()
+    else:
+        image_for_vis = image.copy()
+    
+    # Handle CHW format
+    if image_for_vis.shape[0] in [1, 3]:
+        image_for_vis = np.transpose(image_for_vis, (1, 2, 0))
+    
+    # Ensure image is normalized and convert to RGB if grayscale
+    if image_for_vis.max() > 1:
+        image_for_vis = image_for_vis / 255.0
+    
+    if len(image_for_vis.shape) == 2 or image_for_vis.shape[-1] == 1:
+        if len(image_for_vis.shape) > 2:
+            image_for_vis = image_for_vis.squeeze(-1)
+        image_for_vis = np.stack([image_for_vis] * 3, axis=-1)
+    
+    # Create visualization
+    cam_image = show_cam_on_image(image_for_vis, grayscale_cam, use_rgb=True)
+    
+    # Create figure
+    fig, axes = plt.subplots(1, 3 if mask is not None else 2, figsize=(12, 4))
+    
+    axes[0].imshow(image_for_vis)
+    axes[0].set_title('Original Image')
+    axes[0].axis('off')
+    
+    axes[1].imshow(cam_image)
+    axes[1].set_title('GradCAM Heatmap')
+    axes[1].axis('off')
+    
+    if mask is not None:
+        if isinstance(mask, torch.Tensor):
+            mask = mask.cpu().numpy()
+        if len(mask.shape) > 2:
+            mask = mask.squeeze()
+        axes[2].imshow(mask, cmap='gray')
+        axes[2].set_title('Ground Truth Mask')
+        axes[2].axis('off')
+    
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path)
+    plt.show()
+    
+    return grayscale_cam
+
+def analyze_sample(
+    image,
+    mask=None,
+    predictions=None,
+    refined_prediction=None,
+    uncertainty=None,
+    gradcam=None,
+    save_path=None
+):
+    """
+    Comprehensive visualization and analysis of a single sample.
+    
+    Args:
+        image: Input image
+        mask: Ground truth mask (optional)
+        predictions: Model prediction (optional)
+        refined_prediction: Refined prediction (optional)
+        uncertainty: Uncertainty map (optional)
+        gradcam: GradCAM output (optional)
+        save_path: Path to save the visualization
+    """
+    # Determine number of rows and columns based on available data
+    cols = 2  # At minimum, show original image and one other visualization
+    rows = 1
+    
+    # Count components
+    components = []
+    if image is not None:
+        components.append(('Original', image, 'gray'))
+    
+    if mask is not None:
+        components.append(('Ground Truth', mask, 'gray'))
+    
+    if predictions is not None:
+        components.append(('Prediction', predictions, 'gray'))
+    
+    if refined_prediction is not None:
+        components.append(('Refined', refined_prediction, 'gray'))
+    
+    if uncertainty is not None:
+        components.append(('Uncertainty', uncertainty, 'magma'))
+    
+    if gradcam is not None:
+        components.append(('GradCAM', gradcam, None))  # GradCAM is already colored
+    
+    # Calculate layout
+    cols = min(3, len(components))  # Max 3 columns
+    rows = (len(components) + cols - 1) // cols  # Ceiling division
+    
+    # Create figure
+    fig = plt.figure(figsize=(5*cols, 5*rows))
+    
+    # Preprocess image for visualization if needed
+    if isinstance(image, np.ndarray) and image.shape[0] in [1, 3]:
+        image = np.transpose(image, (1, 2, 0))
+    if len(image.shape) > 2 and image.shape[-1] == 1:
+        image = image.squeeze(-1)
+    
+    # Create overlays if both image and masks are available
+    if mask is not None and predictions is not None:
+        gt_overlay = create_overlay(image, mask, mask_color=[0, 1, 0])  # Green for ground truth
+        pred_overlay = create_overlay(image, predictions, mask_color=[1, 0, 0])  # Red for prediction
+        components.append(('GT Overlay', gt_overlay, None))
+        components.append(('Pred Overlay', pred_overlay, None))
+        
+        # Add refinement overlay if available
+        if refined_prediction is not None:
+            refined_overlay = create_overlay(image, refined_prediction, mask_color=[0, 0, 1])  # Blue for refined
+            components.append(('Refined Overlay', refined_overlay, None))
+    
+    # Recalculate layout
+    cols = min(3, len(components))
+    rows = (len(components) + cols - 1) // cols
+    
+    # Plot all components
+    for i, (title, data, cmap) in enumerate(components):
+        plt.subplot(rows, cols, i + 1)
+        
+        # Ensure data is properly formatted
+        if isinstance(data, torch.Tensor):
+            data = data.cpu().numpy()
+            
+        if len(data.shape) > 2 and data.shape[0] in [1, 3]:
+            data = np.transpose(data, (1, 2, 0))
+            
+        if len(data.shape) > 2 and data.shape[-1] == 1:
+            data = data.squeeze(-1)
+            
+        plt.imshow(data, cmap=cmap)
+        plt.title(title)
+        plt.axis('off')
+    
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path)
+    plt.show()
+
+def visualize_uncertainty(
+    image,
+    prediction,
+    uncertainty,
+    mask=None,
+    threshold=0.5,
+    save_path=None
+):
+    """
+    Visualize uncertainty in prediction with error analysis.
+    
+    Args:
+        image: Input image
+        prediction: Model prediction
+        uncertainty: Uncertainty map
+        mask: Ground truth mask (optional for error analysis)
+        threshold: Threshold to convert probability to binary mask
+        save_path: Path to save visualization
+    """
+    # Preprocess arrays
+    if isinstance(image, torch.Tensor):
+        image = image.cpu().numpy()
+    if isinstance(prediction, torch.Tensor):
+        prediction = prediction.cpu().numpy()
+    if isinstance(uncertainty, torch.Tensor):
+        uncertainty = uncertainty.cpu().numpy()
+    if mask is not None and isinstance(mask, torch.Tensor):
+        mask = mask.cpu().numpy()
+        
+    # Ensure proper shapes
+    if len(image.shape) > 2 and image.shape[0] in [1, 3]:
+        image = np.transpose(image, (1, 2, 0))
+    if len(image.shape) > 2 and image.shape[-1] == 1:
+        image = image.squeeze(-1)
+        
+    if len(prediction.shape) > 2:
+        prediction = prediction.squeeze()
+    if len(uncertainty.shape) > 2:
+        uncertainty = uncertainty.squeeze()
+    if mask is not None and len(mask.shape) > 2:
+        mask = mask.squeeze()
+    
+    # Create binary prediction
+    binary_prediction = (prediction > threshold).astype(np.float32)
+    
+    # Create figure
+    if mask is not None:
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        axes = axes.flatten()
+    else:
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        axes = axes.flatten()
+    
+    # Original image
+    axes[0].imshow(image, cmap='gray' if len(image.shape) == 2 else None)
+    axes[0].set_title('Original Image')
+    axes[0].axis('off')
+    
+    # Prediction with uncertainty
+    # Create a cool visualization where high uncertainty areas are colored differently
+    prediction_viz = np.zeros((*prediction.shape, 3))
+    
+    # Areas of high confidence (salt) - blue
+    prediction_viz[..., 2] = binary_prediction * (1 - uncertainty)
+    # Areas of high confidence (not salt) - black
+    # (this is the default)
+    
+    # Areas of uncertainty - use a gradient
+    uncertainty_mask = uncertainty > 0.2  # Adjust threshold as needed
+    
+    # Red channel - show uncertainty in predicted salt areas
+    prediction_viz[..., 0] = binary_prediction * uncertainty * uncertainty_mask
+    
+    # Green channel - show uncertainty in predicted non-salt areas
+    prediction_viz[..., 1] = (1 - binary_prediction) * uncertainty * uncertainty_mask
+    
+    axes[1].imshow(prediction_viz)
+    axes[1].set_title('Prediction with Uncertainty\nBlue: High confidence salt\nRed: Uncertain salt\nGreen: Uncertain background')
+    axes[1].axis('off')
+    
+    # Raw uncertainty heatmap
+    uncertainty_img = axes[2].imshow(uncertainty, cmap='magma')
+    axes[2].set_title('Uncertainty Heatmap')
+    axes[2].axis('off')
+    plt.colorbar(uncertainty_img, ax=axes[2], shrink=0.8)
+    
+    # If we have ground truth, show error analysis
+    if mask is not None:
+        # True Positive: prediction=1, mask=1 (blue)
+        # True Negative: prediction=0, mask=0 (black)
+        # False Positive: prediction=1, mask=0 (red)
+        # False Negative: prediction=0, mask=1 (green)
+        error_viz = np.zeros((*prediction.shape, 3))
+        
+        # True Positives (blue)
+        error_viz[..., 2] = (binary_prediction == 1) & (mask == 1)
+        
+        # False Positives (red)
+        error_viz[..., 0] = (binary_prediction == 1) & (mask == 0)
+        
+        # False Negatives (green)
+        error_viz[..., 1] = (binary_prediction == 0) & (mask == 1)
+        
+        axes[3].imshow(error_viz)
+        axes[3].set_title('Error Analysis\nBlue: True Positive\nRed: False Positive\nGreen: False Negative')
+        axes[3].axis('off')
+        
+        # Ground truth
+        axes[4].imshow(mask, cmap='gray')
+        axes[4].set_title('Ground Truth')
+        axes[4].axis('off')
+        
+        # Overlay high uncertainty on error map
+        high_uncertainty = uncertainty > np.percentile(uncertainty, 90)  # Top 10% uncertainty
+        error_uncertainty = error_viz.copy()
+        
+        # Highlight high uncertainty areas with yellow
+        error_uncertainty[high_uncertainty, 0] = 1
+        error_uncertainty[high_uncertainty, 1] = 1
+        error_uncertainty[high_uncertainty, 2] = 0
+        
+        axes[5].imshow(error_uncertainty)
+        axes[5].set_title('Errors with High Uncertainty\nYellow: High uncertainty regions')
+        axes[5].axis('off')
+    
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path)
+    plt.show()
+
+def visualize_uncertainty(
+    image,
+    prediction,
+    uncertainty,
+    mask=None,
+    threshold=0.5,
+    save_path=None
+):
+    """
+    Visualize uncertainty in prediction with error analysis.
+    
+    Args:
+        image: Input image
+        prediction: Model prediction
+        uncertainty: Uncertainty map
+        mask: Ground truth mask (optional for error analysis)
+        threshold: Threshold to convert probability to binary mask
+        save_path: Path to save visualization
+    """
+    # Preprocess arrays
+    if isinstance(image, torch.Tensor):
+        image = image.cpu().numpy()
+    if isinstance(prediction, torch.Tensor):
+        prediction = prediction.cpu().numpy()
+    if isinstance(uncertainty, torch.Tensor):
+        uncertainty = uncertainty.cpu().numpy()
+    if mask is not None and isinstance(mask, torch.Tensor):
+        mask = mask.cpu().numpy()
+        
+    # Ensure proper shapes
+    if len(image.shape) > 2 and image.shape[0] in [1, 3]:
+        image = np.transpose(image, (1, 2, 0))
+    if len(image.shape) > 2 and image.shape[-1] == 1:
+        image = image.squeeze(-1)
+        
+    if len(prediction.shape) > 2:
+        prediction = prediction.squeeze()
+    if len(uncertainty.shape) > 2:
+        uncertainty = uncertainty.squeeze()
+    if mask is not None and len(mask.shape) > 2:
+        mask = mask.squeeze()
+    
+    # Create binary prediction
+    binary_prediction = (prediction > threshold).astype(np.float32)
+    
+    # Create figure
+    if mask is not None:
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        axes = axes.flatten()
+    else:
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        axes = axes.flatten()
+    
+    # Original image
+    axes[0].imshow(image, cmap='gray' if len(image.shape) == 2 else None)
+    axes[0].set_title('Original Image')
+    axes[0].axis('off')
+    
+    # Prediction with uncertainty
+    # Create a cool visualization where high uncertainty areas are colored differently
+    prediction_viz = np.zeros((*prediction.shape, 3))
+    
+    # Areas of high confidence (salt) - blue
+    prediction_viz[..., 2] = binary_prediction * (1 - uncertainty)
+    # Areas of high confidence (not salt) - black
+    # (this is the default)
+    
+    # Areas of uncertainty - use a gradient
+    uncertainty_mask = uncertainty > 0.2  # Adjust threshold as needed
+    
+    # Red channel - show uncertainty in predicted salt areas
+    prediction_viz[..., 0] = binary_prediction * uncertainty * uncertainty_mask
+    
+    # Green channel - show uncertainty in predicted non-salt areas
+    prediction_viz[..., 1] = (1 - binary_prediction) * uncertainty * uncertainty_mask
+    
+    axes[1].imshow(prediction_viz)
+    axes[1].set_title('Prediction with Uncertainty\nBlue: High confidence salt\nRed: Uncertain salt\nGreen: Uncertain background')
+    axes[1].axis('off')
+    
+    # Raw uncertainty heatmap
+    uncertainty_img = axes[2].imshow(uncertainty, cmap='magma')
+    axes[2].set_title('Uncertainty Heatmap')
+    axes[2].axis('off')
+    plt.colorbar(uncertainty_img, ax=axes[2], shrink=0.8)
+    
+    # If we have ground truth, show error analysis
+    if mask is not None:
+        # True Positive: prediction=1, mask=1 (blue)
+        # True Negative: prediction=0, mask=0 (black)
+        # False Positive: prediction=1, mask=0 (red)
+        # False Negative: prediction=0, mask=1 (green)
+        error_viz = np.zeros((*prediction.shape, 3))
+        
+        # True Positives (blue)
+        error_viz[..., 2] = (binary_prediction == 1) & (mask == 1)
+        
+        # False Positives (red)
+        error_viz[..., 0] = (binary_prediction == 1) & (mask == 0)
+        
+        # False Negatives (green)
+        error_viz[..., 1] = (binary_prediction == 0) & (mask == 1)
+        
+        axes[3].imshow(error_viz)
+        axes[3].set_title('Error Analysis\nBlue: True Positive\nRed: False Positive\nGreen: False Negative')
+        axes[3].axis('off')
+        
+        # Ground truth
+        axes[4].imshow(mask, cmap='gray')
+        axes[4].set_title('Ground Truth')
+        axes[4].axis('off')
+        
+        # Overlay high uncertainty on error map
+        high_uncertainty = uncertainty > np.percentile(uncertainty, 90)  # Top 10% uncertainty
+        error_uncertainty = error_viz.copy()
+        
+        # Highlight high uncertainty areas with yellow
+        error_uncertainty[high_uncertainty, 0] = 1
+        error_uncertainty[high_uncertainty, 1] = 1
+        error_uncertainty[high_uncertainty, 2] = 0
+        
+        axes[5].imshow(error_uncertainty)
+        axes[5].set_title('Errors with High Uncertainty\nYellow: High uncertainty regions')
+        axes[5].axis('off')
+    
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path)
+    plt.show()

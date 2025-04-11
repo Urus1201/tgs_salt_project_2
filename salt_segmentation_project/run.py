@@ -275,6 +275,7 @@ def pretrain(config_path: str):
         print(f"Error during MAE pretraining: {str(e)}")
         raise
 
+
 def train(config_path: str):
     """Run training pipeline."""
     # Load configuration
@@ -465,7 +466,6 @@ def train_refinement(config_path: str):
     torch.save(refinement_model.state_dict(), checkpoint_path)
     print(f"Refinement model trained and saved to: {checkpoint_path}")
 
-
 def predict(config_path: str):
     """Run inference pipeline."""
     # Load configuration
@@ -612,7 +612,6 @@ def predict(config_path: str):
             empty_threshold=config['inference'].get('empty_threshold', 0.9)
         )
 
-
 def main():
     parser = argparse.ArgumentParser(description='TGS Salt Segmentation')
     parser.add_argument('--config', type=str, required=True,
@@ -631,7 +630,6 @@ def main():
         train_refinement(args.config)
     elif args.mode == 'predict':
         predict(args.config)
-
 
 if __name__ == '__main__':
     main()
