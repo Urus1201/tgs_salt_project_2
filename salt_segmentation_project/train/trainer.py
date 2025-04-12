@@ -8,12 +8,13 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import numpy as np
 from tqdm import tqdm
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union, List, Any
 from pathlib import Path
 import time
 
 from models.segmentation_model import SaltSegmentationModel
 from losses.combined_loss import CombinedLoss
+from losses.deep_supervision_loss import DeepSupervisionLoss
 from utils.logging import ExperimentLogger
 
 
@@ -67,15 +68,36 @@ class Trainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         
-        # Setup loss function
-        self.criterion = CombinedLoss(
-            dice_weight=config['loss']['dice_weight'],
-            focal_weight=config['loss']['focal_weight'],
-            boundary_weight=config['loss']['boundary_weight'],
-            cls_weight=config['loss']['cls_weight'],
-            focal_gamma=config['loss']['focal_gamma'],
-            focal_alpha=config['loss']['focal_alpha']
-        )
+        # Check if using deep supervision
+        self.use_deep_supervision = config['model'].get('use_deep_supervision', False)
+        
+        # Setup loss function - use DeepSupervisionLoss if deep supervision is enabled
+        if self.use_deep_supervision:
+            self.criterion = DeepSupervisionLoss(
+                dice_weight=config['loss']['dice_weight'],
+                focal_weight=config['loss']['focal_weight'],
+                boundary_weight=config['loss']['boundary_weight'],
+                cls_weight=config['loss']['cls_weight'],
+                aux_weight=config['loss'].get('aux_weight', 0.4),
+                focal_gamma=config['loss']['focal_gamma'],
+                focal_alpha=config['loss']['focal_alpha'],
+                aux_decay=config['loss'].get('aux_decay', True)
+            )
+            # Enable deep supervision in model during training
+            if not self.distributed:
+                self.model.enable_deep_supervision()
+            else:
+                # For DDP model, access the module directly
+                self.model.module.enable_deep_supervision()
+        else:
+            self.criterion = CombinedLoss(
+                dice_weight=config['loss']['dice_weight'],
+                focal_weight=config['loss']['focal_weight'],
+                boundary_weight=config['loss']['boundary_weight'],
+                cls_weight=config['loss']['cls_weight'],
+                focal_gamma=config['loss']['focal_gamma'],
+                focal_alpha=config['loss']['focal_alpha']
+            )
         
         # Setup optimizer with gradient clipping
         if config['training']['optimizer'].lower() == 'adamw':
@@ -128,7 +150,7 @@ class Trainer:
         self._validate_data_paths()
 
         # Initialize gradient scaler for mixed precision
-        self.scaler = torch.cuda.amp.GradScaler(enabled=config['training'].get('amp', True))
+        self.scaler = torch.amp.GradScaler(enabled=config['training'].get('amp', True))
 
     def _validate_data_paths(self):
         """Validate that data directories exist before starting training."""
@@ -186,7 +208,11 @@ class Trainer:
         """
         self.model.train()
         epoch_loss = 0
-        metric_totals = {'iou': 0, 'dice': 0, 'cls_acc': 0}
+        # Initialize metrics dictionary with all possible metrics
+        metric_totals = {
+            'iou': 0, 'dice': 0, 'cls_acc': 0,
+            'precision': 0, 'recall': 0, 'f1': 0  # Add the new metrics
+        }
         num_batches = len(self.train_loader)
         
         # Progress bar only on main process
@@ -219,11 +245,39 @@ class Trainer:
                 
                 # Forward pass with automatic mixed precision
                 with torch.amp.autocast('cuda', enabled=use_amp):
-                    seg_logits, cls_logits = self.model(images)
-                seg_logits = F.interpolate(seg_logits, size=masks.shape[2:], mode='bilinear', align_corners=False)
+                    outputs = self.model(images)
+                
+                # For deep supervision model, outputs is a dictionary with 'seg_logits', 'cls_logits', and 'aux_outputs'
+                # For standard model, outputs is a tuple of (seg_logits, cls_logits)
+                if not isinstance(outputs, dict):
+                    seg_logits, cls_logits = outputs
+                    if seg_logits.shape[2:] != masks.shape[2:]:
+                        seg_logits = F.interpolate(seg_logits, size=masks.shape[2:], mode='bilinear', align_corners=False)
+                else:
+                    # Model with deep supervision - outputs already processed by the model
+                    if outputs['seg_logits'].shape[2:] != masks.shape[2:]:
+                        outputs['seg_logits'] = F.interpolate(
+                            outputs['seg_logits'], 
+                            size=masks.shape[2:], 
+                            mode='bilinear', 
+                            align_corners=False
+                        )
+                        
+                        # Also resize auxiliary outputs if present
+                        if 'aux_outputs' in outputs:
+                            for i in range(len(outputs['aux_outputs'])):
+                                outputs['aux_outputs'][i] = F.interpolate(
+                                    outputs['aux_outputs'][i], 
+                                    size=masks.shape[2:], 
+                                    mode='bilinear', 
+                                    align_corners=False
+                                )
+                
+                # Calculate loss
                 loss, loss_dict = self.criterion(
-                    seg_logits, masks,
-                    cls_logits, cls_target
+                    outputs,
+                    masks,
+                    cls_target
                 )
                 
                 # Backward pass with gradient scaling
@@ -244,20 +298,22 @@ class Trainer:
                 
                 # Calculate metrics
                 metrics = self.criterion.compute_metrics(
-                    seg_logits, masks,
-                    cls_logits, cls_target
+                    outputs,
+                    masks,
+                    cls_target
                 )
                 
-                # Update averages
+                # Update averages - handle potentially missing metrics gracefully
                 epoch_loss += loss_dict['total']
                 for k, v in metrics.items():
-                    metric_totals[k] += v
+                    if k in metric_totals:
+                        metric_totals[k] += v
                 
                 # Update progress bar on main process
                 if not self.distributed or self.local_rank == 0:
                     pbar.set_postfix({
                         'loss': f"{loss_dict['total']:.4f}",
-                        'iou': f"{metrics['iou']:.4f}"
+                        'iou': f"{metrics.get('iou', 0):.4f}"
                     })
             
             except FileNotFoundError as e:
@@ -309,9 +365,20 @@ class Trainer:
         Returns:
             Dictionary of validation metrics
         """
+        # During validation, disable deep supervision to get only main outputs
+        if self.use_deep_supervision:
+            if not self.distributed:
+                self.model.disable_deep_supervision()
+            else:
+                self.model.module.disable_deep_supervision()
+        
         self.model.eval()
         val_loss = 0
-        metric_totals = {'iou': 0, 'dice': 0, 'cls_acc': 0}
+        # Initialize metrics with all possible metrics
+        metric_totals = {
+            'iou': 0, 'dice': 0, 'cls_acc': 0,
+            'precision': 0, 'recall': 0, 'f1': 0  # Add the new metrics
+        }
         num_batches = len(self.val_loader)
         
         val_images = []
@@ -326,23 +393,39 @@ class Trainer:
             
             # Forward pass with automatic mixed precision
             with torch.amp.autocast('cuda'):
-                seg_logits, cls_logits = self.model(images)
-            seg_logits = F.interpolate(seg_logits, size=masks.shape[2:], mode='bilinear', align_corners=False)
+                outputs = self.model(images)
+            
+            # Handle different output formats
+            if not isinstance(outputs, dict):
+                seg_logits, cls_logits = outputs
+                if seg_logits.shape[2:] != masks.shape[2:]:
+                    seg_logits = F.interpolate(seg_logits, size=masks.shape[2:], mode='bilinear', align_corners=False)
+            else:
+                # Model returning dictionary for deep supervision
+                seg_logits = outputs['seg_logits']
+                cls_logits = outputs['cls_logits'] 
+                if seg_logits.shape[2:] != masks.shape[2:]:
+                    seg_logits = F.interpolate(seg_logits, size=masks.shape[2:], mode='bilinear', align_corners=False)
+            
+            # Calculate loss - in validation we'll always get (seg_logits, cls_logits) tuple thanks to disabling deep supervision
             loss, loss_dict = self.criterion(
-                seg_logits, masks,
-                cls_logits, cls_target
+                (seg_logits, cls_logits),
+                masks,
+                cls_target
             )
             
             # Calculate metrics
             metrics = self.criterion.compute_metrics(
-                seg_logits, masks,
-                cls_logits, cls_target
+                (seg_logits, cls_logits),
+                masks,
+                cls_target
             )
             
-            # Update totals
+            # Update totals - handle potentially missing metrics gracefully
             val_loss += loss_dict['total']
             for k, v in metrics.items():
-                metric_totals[k] += v
+                if k in metric_totals:
+                    metric_totals[k] += v
                 
             # Store predictions for visualization (main process only)
             if not self.distributed or self.local_rank == 0:
@@ -352,6 +435,13 @@ class Trainer:
                     val_predictions['seg_pred'].append(torch.sigmoid(seg_logits[:4]).cpu())
                     val_predictions['cls_pred'].append(torch.sigmoid(cls_logits[:4]).cpu())
         
+        # Re-enable deep supervision for training if needed
+        if self.use_deep_supervision:
+            if not self.distributed:
+                self.model.enable_deep_supervision()
+            else:
+                self.model.module.enable_deep_supervision()
+                
         # Average metrics across processes for distributed training
         if self.distributed:
             avg_loss = val_loss / num_batches

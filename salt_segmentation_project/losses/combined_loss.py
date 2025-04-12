@@ -19,7 +19,7 @@ class CombinedLoss(nn.Module):
         boundary_weight: float = 1.0,
         cls_weight: float = 0.5,
         focal_gamma: float = 2.0,
-        focal_alpha: float = 0.25,
+        focal_alpha: float = 0.8, #0.25
         boundary_theta: float = 0.7
     ):
         """Initialize combined loss with component weights.

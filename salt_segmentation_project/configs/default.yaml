@@ -35,18 +35,26 @@ augmentation:
 # Model settings
 model:
   name: "swin_unet"
-  swin_variant: "microsoft/swin-tiny-patch4-window7-224"
+  swin_variant: "microsoft/swin-base-patch4-window7-224"
   pretrained: true              # Use ImageNet weights
-  mae_pretrained: true         # Set to true to use the pretrained weights
+  mae_pretrained: true          # Set to true to use the pretrained weights
   mae_checkpoint: "checkpoints/mae/best_encoder.pth"
   in_channels: 3
   seg_out_channels: 1
   cls_out_channels: 1
   cls_head: true
+  # Enhanced model features
+  use_deep_supervision: true    # Enable deep supervision
+  use_attention_gates: true     # Enable attention gates in decoder
+  use_aspp: true                # Enable ASPP module
+  use_checkpoint: true          # Enable gradient checkpointing
+  dropout_rate: 0.1             # Dropout rate
+  use_layer_norm: true          # Use LayerNorm instead of BatchNorm
+  cls_use_combined_pooling: true # Use combined avg+max pooling in classifier
 
 # MAE pretraining settings
 mae:
-  model_name: "microsoft/swin-tiny-patch4-window7-224"
+  model_name: "microsoft/swin-base-patch4-window7-224"
   pretrained: false  # Start without pretrained weights for pretraining
   img_size: 101
   patch_size: 4
@@ -69,8 +77,7 @@ mae:
   device: "cuda"
   batch_size: 64
   num_epochs: 15
-  learning_rate: 0.0001  # Keep this for pretrain_mae.py
-  lr: 0.0001  # Add this for compatibility with other parts
+  learning_rate: 0.0001  # Learning rate for optimizer
   weight_decay: 0.05
   lr_decay_factor: 0.5
   lr_decay_patience: 5
@@ -110,6 +117,9 @@ loss:
   cls_weight: 0.5
   focal_gamma: 2.0
   focal_alpha: 0.25
+  # Deep supervision loss settings
+  aux_weight: 0.4    # Weight for auxiliary outputs
+  aux_decay: true    # Decay weights with depth
 
 # Inference settings
 inference:
@@ -118,7 +128,7 @@ inference:
   threshold: 0.5  # Probability threshold for binary prediction
   use_tta: true   # Use test-time augmentation
   use_mc_dropout: true  # Use Monte Carlo dropout for uncertainty
-  mc_samples: 10  # Number of MC dropout samples
+  mc_samples: 30  # Number of MC dropout samples
   min_size: 100
   refinement:
     enabled: true

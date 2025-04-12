@@ -1,109 +1,25 @@
 import torch
 import torch.nn as nn
-from typing import Tuple, Optional
+import torch.nn.functional as F
+from typing import Tuple, Optional, List, Dict, Union
 
 from .encoder_swin import SwinEncoder
 from .decoder_unet import UNetDecoder
 from .classifier_head import ClassifierHead
 
-
-# class SaltSegmentationModel(nn.Module):
-#     """Combined model with Swin encoder, U-Net decoder, and classification head."""
-#     def __init__(
-#         self,
-#         img_size: int = 101,
-#         in_channels: int = 3,  # 3 for 2.5D input
-#         embed_dim: int = 96,
-#         depths: list = [2, 2, 6, 2],
-#         num_heads: list = [3, 6, 12, 24],
-#         window_size: int = 7,
-#         dropout_rate: float = 0.1,
-#         decoder_dropout: bool = True,
-#         use_checkpoint: bool = False,
-#         pretrained_encoder: Optional[str] = None
-#     ):
-#         super().__init__()
-        
-#         # Create Swin Transformer encoder
-#         self.encoder = SwinEncoder(
-#             img_size=img_size,
-#             patch_size=4,  # Fixed patch size for 101x101 input
-#             in_channels=in_channels,
-#             embed_dim=embed_dim,
-#             depths=depths,
-#             num_heads=num_heads,
-#             window_size=window_size,
-#             dropout=dropout_rate,
-#             use_checkpoint=use_checkpoint
-#         )
-        
-#         # Create U-Net decoder
-#         self.decoder = UNetDecoder(
-#             enc_channels=self.encoder.out_channels,
-#             use_dropout=decoder_dropout
-#         )
-        
-#         # Create classification head
-#         self.classifier = ClassifierHead(
-#             in_features=self.encoder.out_channels[-1],
-#             hidden_dim=256,
-#             dropout_rate=dropout_rate
-#         )
-        
-#         # Load pretrained encoder if specified
-#         if pretrained_encoder is not None:
-#             encoder_state = torch.load(pretrained_encoder, map_location='cpu')
-#             self.encoder.load_state_dict(encoder_state)
-            
-#         self._mc_dropout_enabled = False
-        
-#     def enable_mc_dropout(self):
-#         """Enable MC Dropout for uncertainty estimation."""
-#         self._mc_dropout_enabled = True
-        
-#     def disable_mc_dropout(self):
-#         """Disable MC Dropout (normal inference mode)."""
-#         self._mc_dropout_enabled = False
-        
-#     def train(self, mode: bool = True):
-#         """Override train mode to handle MC Dropout."""
-#         super().train(mode)
-#         if self._mc_dropout_enabled:
-#             # Keep dropout enabled even in eval mode
-#             for m in self.modules():
-#                 if isinstance(m, nn.Dropout2d) or isinstance(m, nn.Dropout):
-#                     m.train()
-#         return self
-    
-#     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-#         """
-#         x: input tensor of shape (B, 3, 101, 101) representing 3 stacked slices.
-#         Returns segmentation mask logits and classification logits.
-#         """
-#         # Encoder forward: get multi-scale feature maps
-#         features, padding_info = self.encoder(x)  
-        
-#         # Decoder uses features from encoder
-#         seg_out = self.decoder(features, padding_info)
-        
-#         # Classification head uses the last encoder feature
-#         class_out = self.classifier(features[-1])
-        
-#         return seg_out, class_out
-
-import torch
-import torch.nn as nn
-
-from models.encoder_swin import SwinEncoder
-from models.decoder_unet import UNetDecoder
-from models.classifier_head import ClassifierHead
-
 class SaltSegmentationModel(nn.Module):
     """
-    Swin Transformer + UNet Decoder + Classification Head (multi-task learning).
+    Enhanced Swin Transformer + UNet Decoder + Classification Head (multi-task learning).
+    
+    Features:
+    - Swin Transformer encoder
+    - Enhanced UNet decoder with attention gates and residual connections
+    - ASPP module for multi-scale feature aggregation
+    - Deep supervision for better gradient flow
+    - Multi-task learning with segmentation and classification heads
     
     Input:  (B, 3, H, W)  →  3 stacked grayscale slices (2.5D)
-    Output: segmentation map + salt presence logit
+    Output: segmentation map + salt presence logit (+ auxiliary outputs in training)
     """
     def __init__(
         self,
@@ -111,10 +27,16 @@ class SaltSegmentationModel(nn.Module):
         in_channels=3,
         seg_out_channels=1,
         cls_out_channels=1,
-        pretrained=True
+        pretrained=True,
+        use_deep_supervision=True,
+        use_checkpoint=False,
+        dropout_rate=0.1
     ):
         super().__init__()
 
+        # Configuration
+        self.use_deep_supervision = use_deep_supervision
+        
         # 1. Swin Transformer Encoder from timm
         self.encoder = SwinEncoder(
             model_name=model_name,
@@ -122,21 +44,27 @@ class SaltSegmentationModel(nn.Module):
             pretrained=pretrained
         )
 
-        # 2. UNet-style Decoder
-        self.decoder = UNetDecoder(enc_feature_channels=self.encoder.out_channels)
+        # 2. Enhanced UNet-style Decoder
+        self.decoder = UNetDecoder(
+            enc_feature_channels=self.encoder.out_channels,
+            dropout_rate=dropout_rate,
+            use_checkpoint=use_checkpoint
+        )
 
         # 3. Segmentation Head (1x1 conv)
         self.segmentation_head = nn.Sequential(
             nn.Conv2d(self.decoder.out_channels, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
-            nn.Conv2d(32, 1, kernel_size=1)
+            nn.Dropout2d(dropout_rate),
+            nn.Conv2d(32, seg_out_channels, kernel_size=1)
         )
 
         # 4. Classification Head (salt presence)
         self.classifier_head = ClassifierHead(
             in_features=self.encoder.out_channels[-1],  # deepest feature map (e.g., 768)
-            num_classes=cls_out_channels
+            num_classes=cls_out_channels,
+            dropout_rate=dropout_rate
         )
         
         # Track if we should apply sigmoid during inference
@@ -149,6 +77,16 @@ class SaltSegmentationModel(nn.Module):
     def disable_sigmoid(self):
         """Disable sigmoid activation (raw logits for training with BCE loss)."""
         self.apply_sigmoid = False
+
+    def enable_deep_supervision(self):
+        """Enable deep supervision for training."""
+        self.use_deep_supervision = True
+        self.decoder.enable_deep_supervision()
+        
+    def disable_deep_supervision(self):
+        """Disable deep supervision for inference."""
+        self.use_deep_supervision = False
+        self.decoder.disable_deep_supervision()
 
     def enable_mc_dropout(self):
         """Enable Monte Carlo dropout by forcing dropout layers into train mode."""
@@ -168,24 +106,62 @@ class SaltSegmentationModel(nn.Module):
             x: Tensor (B, 3, H, W)
 
         Returns:
-            seg_logits: (B, 1, H_out, W_out) - raw segmentation logits
-            cls_logits: (B, 1)               - raw classification logit (salt/no salt)
+            Training mode with deep supervision:
+                dict with keys:
+                - 'seg_logits': Main segmentation output (B, 1, H_out, W_out)
+                - 'cls_logits': Classification output (B, 1)
+                - 'aux_outputs': List of auxiliary segmentation outputs at different scales
+            
+            Inference mode or without deep supervision:
+                seg_logits: (B, 1, H_out, W_out) - segmentation output
+                cls_logits: (B, 1) - classification output
         """
         # Save original input size for upsampling
         original_size = (x.shape[2], x.shape[3])
         
-        encoder_feats = self.encoder(x)              # [c1, c2, c3, c4]
-        decoder_output = self.decoder(encoder_feats) # final decoder feature map
-        seg_logits = self.segmentation_head(decoder_output)
+        # Encoder features
+        encoder_feats = self.encoder(x)  # [c1, c2, c3, c4]
         
-        # Ensure output matches input resolution with bilinear upsampling
-        if seg_logits.shape[2:] != original_size:
-            seg_logits = nn.functional.interpolate(
+        # Decoder with potential deep supervision outputs
+        if self.use_deep_supervision and self.training:
+            # Returns main output and deep supervision outputs
+            decoder_output, deep_outputs = self.decoder(encoder_feats)
+            
+            # Process main segmentation output
+            seg_logits = self.segmentation_head(decoder_output)
+            
+            # Ensure all outputs match input resolution
+            seg_logits = F.interpolate(
                 seg_logits, 
                 size=original_size, 
                 mode='bilinear', 
                 align_corners=False
             )
+            
+            # Process and resize auxiliary outputs
+            aux_outputs = []
+            for aux_out in deep_outputs:
+                aux_out = F.interpolate(
+                    aux_out,
+                    size=original_size,
+                    mode='bilinear',
+                    align_corners=False
+                )
+                aux_outputs.append(aux_out)
+                
+        else:
+            # Regular forward pass without deep supervision
+            decoder_output = self.decoder(encoder_feats)
+            seg_logits = self.segmentation_head(decoder_output)
+            
+            # Ensure output matches input resolution
+            if seg_logits.shape[2:] != original_size:
+                seg_logits = F.interpolate(
+                    seg_logits, 
+                    size=original_size, 
+                    mode='bilinear', 
+                    align_corners=False
+                )
         
         # Apply sigmoid during inference if enabled
         if self.apply_sigmoid and not self.training:
@@ -194,4 +170,12 @@ class SaltSegmentationModel(nn.Module):
         # Classification from last encoder stage
         cls_logits = self.classifier_head(encoder_feats[-1])
 
-        return seg_logits, cls_logits
+        # Return different outputs depending on mode
+        if self.use_deep_supervision and self.training:
+            return {
+                'seg_logits': seg_logits,
+                'cls_logits': cls_logits,
+                'aux_outputs': aux_outputs
+            }
+        else:
+            return seg_logits, cls_logits

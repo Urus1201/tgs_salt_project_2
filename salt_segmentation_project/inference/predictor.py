@@ -293,18 +293,51 @@ class Predictor:
     def get_binary_prediction(
         self,
         predictions: Dict[str, torch.Tensor],
-        threshold: Optional[float] = None
+        threshold: Optional[float] = None,
+        cls_low_threshold: float = 0.1,
+        cls_medium_threshold: float = 0.4,
+        seg_threshold_adjustment: float = 1.5  # Multiplier for threshold
     ) -> torch.Tensor:
-        """Get binary mask from predictions.
+        """Get binary mask from predictions using classification guidance.
         
         Args:
             predictions: Dictionary with predictions from predict_single/predict_batch
             threshold: Optional override for default threshold
+            cls_low_threshold: Classification threshold below which to zero out masks
+            cls_medium_threshold: Classification threshold below which to adjust segmentation threshold
+            seg_threshold_adjustment: How much to adjust segmentation threshold for low confidence
             
         Returns:
             Binary mask tensor
         """
         if threshold is None:
             threshold = self.threshold
+        
+        # Get classification confidence
+        cls_confidence = predictions['cls_pred']
+        batch_size = cls_confidence.size(0)
+        seg_masks = []
+        
+        # Process each image in the batch
+        for i in range(batch_size):
+            single_confidence = cls_confidence[i].item()
+            single_seg_pred = predictions['seg_pred'][i:i+1]  # Keep batch dimension
             
-        return (predictions['seg_pred'] > threshold).float()
+            if single_confidence < cls_low_threshold:
+                # Very low confidence of salt presence - return empty mask
+                seg_masks.append(torch.zeros_like(single_seg_pred))
+                
+            elif single_confidence < cls_medium_threshold:
+                # Low to medium confidence - use higher threshold to be more conservative
+                adjusted_threshold = threshold * seg_threshold_adjustment
+                seg_masks.append((single_seg_pred > adjusted_threshold).float())
+                
+            else:
+                # High confidence - use normal threshold
+                seg_masks.append((single_seg_pred > threshold).float())
+        
+        # Combine results back into a batch
+        if batch_size > 1:
+            return torch.cat(seg_masks, dim=0)
+        else:
+            return seg_masks[0]

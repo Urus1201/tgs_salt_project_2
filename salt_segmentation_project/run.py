@@ -22,7 +22,7 @@ from inference.submission import SubmissionGenerator, mask_to_rle
 from inference.refinement import RefinementNet, UncertaintyRefinement, train_refinement_model
 from utils.path_utils import prepare_data_paths
 from utils.find_checkpoint import find_checkpoint
-from tqdm import tqdm  # import already present
+from tqdm import tqdm
 
 
 def load_config(config_path: str) -> Dict:
@@ -128,43 +128,6 @@ def create_dataloaders(config: Dict, local_rank: int = -1) -> Tuple[DataLoader, 
     return train_loader, val_loader, test_loader
 
 
-def train_epoch(model, dataloader, optimizer, device, epoch, vis_dir=None):
-    """Train model for one epoch."""
-    model.train()
-    total_loss = 0.0
-    for batch_idx, (images, _) in enumerate(tqdm(dataloader, desc=f"Training Epoch {epoch}")):
-        images = images.to(device)
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = outputs['loss']
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    return total_loss / len(dataloader)
-
-
-def validate(model, dataloader, device, epoch, vis_dir=None):
-    """Validate model."""
-    model.eval()
-    total_loss = 0.0
-    with torch.no_grad():
-        for batch_idx, (images, _) in enumerate(tqdm(dataloader, desc=f"Validation Epoch {epoch}")):
-            images = images.to(device)
-            outputs = model(images)
-            loss = outputs['loss']
-            total_loss += loss.item()
-    return total_loss / len(dataloader)
-
-
-def train_mae(model, train_loader, val_loader, optimizer, scheduler, num_epochs, device, 
-              checkpoint_dir, log_dir, vis_dir=None):
-    """Train MAE model."""
-    for epoch in range(num_epochs):
-        train_loss = train_epoch(model, train_loader, optimizer, device, epoch, vis_dir)
-        val_loss = validate(model, val_loader, device, epoch, vis_dir)
-        scheduler.step(val_loss)
-        torch.save(model.state_dict(), os.path.join(checkpoint_dir, f'epoch_{epoch}.pth'))
-
 def convert_mae_checkpoint_for_timm(mae_ckpt_path: str) -> OrderedDict:
     """
     Convert a MAE-pretrained Swin encoder checkpoint to match timm's Swin format.
@@ -199,6 +162,7 @@ def convert_mae_checkpoint_for_timm(mae_ckpt_path: str) -> OrderedDict:
     print(f"Converted {len(new_state_dict)} parameters ready to load.")
     return new_state_dict
 
+
 def train_worker(
     local_rank: int,
     world_size: int,
@@ -216,15 +180,11 @@ def train_worker(
     
     # Create model
     model = SaltSegmentationModel(
-        img_size=config['model']['img_size'],
-        in_channels=3 if config['data']['use_2_5d'] else 1,
-        embed_dim=config['model']['embed_dim'],
-        depths=config['model']['depths'],
-        num_heads=config['model']['num_heads'],
-        window_size=config['model']['window_size'],
-        dropout_rate=config['model']['dropout_rate'],
-        use_checkpoint=config['model']['use_checkpoint'],
-        pretrained_encoder=config['model']['mae_checkpoint'] if config['model']['mae_pretrained'] else None
+        model_name=config['model']['swin_variant'],
+        in_channels=config['model']['in_channels'],
+        seg_out_channels=config['model']['seg_out_channels'],
+        cls_out_channels=config['model']['cls_out_channels'],
+        pretrained=config['model']['pretrained']
     )
     
     # Create trainer with DDP
@@ -240,7 +200,7 @@ def train_worker(
     # Train model
     trainer.train(
         num_epochs=config['training']['num_epochs'],
-        save_dir=config['training']['save_dir'],  # Ensure checkpoints are saved directly in the specified directory
+        save_dir=config['training']['save_dir'],
         early_stop_patience=config['training']['early_stop_patience']
     )
 
@@ -254,18 +214,14 @@ def pretrain(config_path: str):
     if 'mae' not in config:
         raise ValueError("Configuration file missing 'mae' section")
     
-    # Convert any parameters that might have inconsistent naming
-    # Convert 'learning_rate' to 'lr' if needed elsewhere in the code
-    if 'learning_rate' in config['mae'] and 'lr' not in config['mae']:
-        config['mae']['lr'] = config['mae']['learning_rate']
+    # Ensure learning_rate parameter exists
+    if 'learning_rate' not in config['mae']:
+        raise ValueError("Configuration file missing 'learning_rate' parameter in 'mae' section")
     
     # Create save directory
     os.makedirs(config['mae']['save_dir'], exist_ok=True)
     
     try:
-        # All the commented code remains the same
-        # ...existing code...
-        
         # Run pretraining
         pretrain_mae(config)
         
