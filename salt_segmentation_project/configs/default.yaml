@@ -95,7 +95,8 @@ training:
   lr: 0.0001
   weight_decay: 0.01
   scheduler: "cosine"  # "cosine" or "plateau"
-  warmup_epochs: 5
+  warmup_epochs: 5  # Number of epochs for warmup
+  warmup_start_lr: 0.00001  # Starting learning rate for warmup (1/10 of main lr)
   early_stop_patience: 15
   grad_clip: 5.0
   save_dir: "checkpoints/logs"
@@ -140,7 +141,7 @@ inference:
 refinement:
   main_model_checkpoint: "${CHECKPOINT_PATH:checkpoints/model_best.pth}"  # Path to main model checkpoint
   checkpoint_path: "checkpoints/refinement_model.pth"  # Where to save refinement model
-  epochs: 50
+  epochs: 500
   learning_rate: 1e-4
   weight_decay: 1e-5
   patience: 10

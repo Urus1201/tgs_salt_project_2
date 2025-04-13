@@ -16,6 +16,7 @@ from models.segmentation_model import SaltSegmentationModel
 from losses.combined_loss import CombinedLoss
 from losses.deep_supervision_loss import DeepSupervisionLoss
 from utils.logging import ExperimentLogger
+from utils.lr_scheduler import create_scheduler_with_warmup
 
 
 def setup_ddp(local_rank: int, world_size: int):
@@ -112,23 +113,12 @@ class Trainer:
                 lr=config['training']['lr']
             )
         
-        # Setup learning rate scheduler
-        if config['training']['scheduler'] == 'cosine':
-            self.scheduler = CosineAnnealingLR(
-                self.optimizer,
-                T_max=config['training']['num_epochs'],
-                eta_min=config['training']['lr'] * 0.01
-            )
-        elif config['training']['scheduler'] == 'plateau':
-            self.scheduler = ReduceLROnPlateau(
-                self.optimizer,
-                mode='max',
-                factor=0.5,
-                patience=5,
-                verbose=True
-            )
-        else:
-            self.scheduler = None
+        # Setup learning rate scheduler with warmup support
+        self.scheduler = create_scheduler_with_warmup(
+            self.optimizer,
+            config,
+            config['training']['num_epochs']
+        )
             
         # Initialize tracking variables
         self.current_epoch = 0
@@ -496,6 +486,7 @@ class Trainer:
             os.makedirs(save_dir, exist_ok=True)
             
         patience_counter = 0
+        learning_rates = []
         
         for epoch in range(num_epochs):
             if self.distributed:
@@ -517,6 +508,13 @@ class Trainer:
                     self.scheduler.step(val_metrics['iou'])
                 else:
                     self.scheduler.step()
+                
+                # Record current learning rate for logging
+                if not self.distributed or self.local_rank == 0:
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    learning_rates.append(current_lr)
+                    if self.logger is not None:
+                        self.logger.logger.info(f"Current learning rate: {current_lr:.7f}")
             
             # Save best model (main process only)
             if not self.distributed or self.local_rank == 0:
@@ -548,8 +546,15 @@ class Trainer:
             if self.distributed:
                 dist.barrier()
         
-        # Plot final training curves (main process only)
+        # Plot learning rate curve at the end of training
         if not self.distributed or self.local_rank == 0:
+            if self.logger is not None and learning_rates:
+                from utils.visualization import plot_learning_rate_schedule
+                plot_learning_rate_schedule(
+                    learning_rates, 
+                    os.path.join(save_dir, 'learning_rate_schedule.png')
+                )
+            
             self.logger.plot_metrics()
             
         # Clean up distributed training

@@ -58,24 +58,48 @@ class Predictor:
         predictions = []
         
         # Original image
-        seg_logits, _ = self.model(image)
+        model_output = self.model(image)
+        # Handle both tuple and dictionary outputs
+        if isinstance(model_output, dict):
+            seg_logits = model_output['seg_logits']
+        else:
+            seg_logits, _ = model_output
+            
         predictions.append(torch.sigmoid(seg_logits))
         
         # Horizontal flip
         flipped_h = torch.flip(image, dims=[3])
-        seg_logits, _ = self.model(flipped_h)
+        model_output = self.model(flipped_h)
+        # Handle both tuple and dictionary outputs
+        if isinstance(model_output, dict):
+            seg_logits = model_output['seg_logits']
+        else:
+            seg_logits, _ = model_output
+            
         pred_h = torch.sigmoid(seg_logits)
         predictions.append(torch.flip(pred_h, dims=[3]))
         
         # Vertical flip
         flipped_v = torch.flip(image, dims=[2])
-        seg_logits, _ = self.model(flipped_v)
+        model_output = self.model(flipped_v)
+        # Handle both tuple and dictionary outputs
+        if isinstance(model_output, dict):
+            seg_logits = model_output['seg_logits']
+        else:
+            seg_logits, _ = model_output
+            
         pred_v = torch.sigmoid(seg_logits)
         predictions.append(torch.flip(pred_v, dims=[2]))
         
         # Both flips
         flipped_hv = torch.flip(image, dims=[2, 3])
-        seg_logits, _ = self.model(flipped_hv)
+        model_output = self.model(flipped_hv)
+        # Handle both tuple and dictionary outputs
+        if isinstance(model_output, dict):
+            seg_logits = model_output['seg_logits']
+        else:
+            seg_logits, _ = model_output
+            
         pred_hv = torch.sigmoid(seg_logits)
         predictions.append(torch.flip(pred_hv, dims=[2, 3]))
         
@@ -108,7 +132,14 @@ class Predictor:
         
         # Multiple forward passes with dropout
         for _ in range(self.mc_samples):
-            seg_logits, cls_logits = self.model(image)
+            model_output = self.model(image)
+            # Handle both tuple and dictionary outputs
+            if isinstance(model_output, dict):
+                seg_logits = model_output['seg_logits']
+                cls_logits = model_output['cls_logits']
+            else:
+                seg_logits, cls_logits = model_output
+                
             predictions_seg.append(torch.sigmoid(seg_logits))
             predictions_cls.append(torch.sigmoid(cls_logits))
             
@@ -172,7 +203,14 @@ class Predictor:
         
         # If neither TTA nor MC dropout, do regular forward pass
         if seg_pred is None:
-            seg_logits, cls_logits = self.model(image)
+            model_output = self.model(image)
+            # Handle both tuple and dictionary outputs
+            if isinstance(model_output, dict):
+                seg_logits = model_output['seg_logits']
+                cls_logits = model_output['cls_logits']
+            else:
+                seg_logits, cls_logits = model_output
+                
             seg_pred = torch.sigmoid(seg_logits)
             cls_pred = torch.sigmoid(cls_logits)
             seg_var = torch.zeros_like(seg_pred)
@@ -208,25 +246,53 @@ class Predictor:
                 all_cls_preds = []
                 
                 # Original images
-                seg_logits, cls_logits = self.model(images)
+                model_output = self.model(images)
+                # Handle both tuple and dictionary outputs
+                if isinstance(model_output, dict):
+                    seg_logits = model_output['seg_logits']
+                    cls_logits = model_output['cls_logits']
+                else:
+                    seg_logits, cls_logits = model_output
+                    
                 all_seg_preds.append(torch.sigmoid(seg_logits))
                 all_cls_preds.append(torch.sigmoid(cls_logits))
                 
                 # Horizontal flip
                 flipped_h = torch.flip(images, dims=[3])
-                seg_logits, cls_logits = self.model(flipped_h)
+                model_output = self.model(flipped_h)
+                # Handle both tuple and dictionary outputs
+                if isinstance(model_output, dict):
+                    seg_logits = model_output['seg_logits']
+                    cls_logits = model_output['cls_logits']
+                else:
+                    seg_logits, cls_logits = model_output
+                    
                 all_seg_preds.append(torch.flip(torch.sigmoid(seg_logits), dims=[3]))
                 all_cls_preds.append(torch.sigmoid(cls_logits))
                 
                 # Vertical flip
                 flipped_v = torch.flip(images, dims=[2])
-                seg_logits, cls_logits = self.model(flipped_v)
+                model_output = self.model(flipped_v)
+                # Handle both tuple and dictionary outputs
+                if isinstance(model_output, dict):
+                    seg_logits = model_output['seg_logits']
+                    cls_logits = model_output['cls_logits']
+                else:
+                    seg_logits, cls_logits = model_output
+                    
                 all_seg_preds.append(torch.flip(torch.sigmoid(seg_logits), dims=[2]))
                 all_cls_preds.append(torch.sigmoid(cls_logits))
                 
                 # Both flips
                 flipped_hv = torch.flip(images, dims=[2, 3])
-                seg_logits, cls_logits = self.model(flipped_hv)
+                model_output = self.model(flipped_hv)
+                # Handle both tuple and dictionary outputs
+                if isinstance(model_output, dict):
+                    seg_logits = model_output['seg_logits']
+                    cls_logits = model_output['cls_logits']
+                else:
+                    seg_logits, cls_logits = model_output
+                    
                 all_seg_preds.append(torch.flip(torch.sigmoid(seg_logits), dims=[2, 3]))
                 all_cls_preds.append(torch.sigmoid(cls_logits))
                 
@@ -246,7 +312,14 @@ class Predictor:
                 
                 self.model.enable_mc_dropout()
                 for _ in range(self.mc_samples):
-                    seg_logits, cls_logits = self.model(images)
+                    model_output = self.model(images)
+                    # Handle both tuple and dictionary outputs
+                    if isinstance(model_output, dict):
+                        seg_logits = model_output['seg_logits']
+                        cls_logits = model_output['cls_logits']
+                    else:
+                        seg_logits, cls_logits = model_output
+                        
                     mc_seg_preds.append(torch.sigmoid(seg_logits))
                     mc_cls_preds.append(torch.sigmoid(cls_logits))
                 self.model.disable_mc_dropout()
@@ -277,7 +350,14 @@ class Predictor:
             
             if not (self.use_tta or self.use_mc_dropout):
                 # Regular forward pass
-                seg_logits, cls_logits = self.model(images)
+                model_output = self.model(images)
+                # Handle both tuple and dictionary outputs
+                if isinstance(model_output, dict):
+                    seg_logits = model_output['seg_logits']
+                    cls_logits = model_output['cls_logits']
+                else:
+                    seg_logits, cls_logits = model_output
+                    
                 seg_pred = torch.sigmoid(seg_logits)
                 cls_pred = torch.sigmoid(cls_logits)
                 seg_var = torch.zeros_like(seg_pred)

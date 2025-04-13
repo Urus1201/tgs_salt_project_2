@@ -12,8 +12,9 @@ def find_checkpoint(config):
     """
     save_dir = config['training']['save_dir']
     subdirs = [os.path.join(save_dir, d) for d in os.listdir(save_dir) if os.path.isdir(os.path.join(save_dir, d))]
-    latest_dir = max(subdirs, key=os.path.getctime)
+    latest_dir = max(subdirs, key=os.path.getmtime)
     best_path = os.path.join(latest_dir, "model_best.pth")
+    print("best path: ", best_path)
     if os.path.exists(best_path):
         return best_path
     else:
